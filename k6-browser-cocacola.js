@@ -1,0 +1,351 @@
+import { browser } from 'k6/browser';
+import { check, sleep } from 'k6';
+import { Trend, Counter } from 'k6/metrics';
+
+// NOTE ON NAMING: none of our custom metrics below use the "browser_" prefix.
+// k6's browser module auto-registers its own built-in metrics the moment
+// k6/browser is imported — including ones named exactly browser_web_vital_fcp,
+// browser_web_vital_lcp, browser_web_vital_cls, and browser_web_vital_ttfb,
+// each pre-typed as a "time" metric. Declaring a Trend/Counter with the same
+// name but a different value type throws "metric '...' already exists but
+// with a value type time, instead of default" and kills the script at
+// init time. Using the "ux_" prefix sidesteps that collision entirely (now,
+// and against any future built-ins k6 adds).
+
+// ---- Page-level Web Vitals (one sample per page load) ----
+const WebVitalFCP =
+  new Trend('ux_web_vital_fcp');
+
+const WebVitalLCP =
+  new Trend('ux_web_vital_lcp');
+
+const WebVitalCLS =
+  new Trend('ux_web_vital_cls');
+
+const WebVitalTTFB =
+  new Trend('ux_web_vital_ttfb');
+
+const DomInteractive =
+  new Trend('ux_dom_interactive_ms');
+
+const BrowserPageDuration =
+  new Trend('ux_page_duration_ms');
+
+// ---- Resource-level metrics (one sample PER CAPTURED ASSET, tagged with
+// resource_url/resource_type/domain/status so the report generator can
+// attach each one back to the page ("url_label") that loaded it, without
+// ever treating a resource as a page of its own). ----
+const BrowserResourceDuration =
+  new Trend('ux_resource_duration_ms');
+
+const BrowserResourceDns =
+  new Trend('ux_resource_dns_ms');
+
+const BrowserResourceTcp =
+  new Trend('ux_resource_tcp_ms');
+
+const BrowserResourceTls =
+  new Trend('ux_resource_tls_ms');
+
+const BrowserResourceTtfb =
+  new Trend('ux_resource_ttfb_ms');
+
+const BrowserResourceDownload =
+  new Trend('ux_resource_download_ms');
+
+const BrowserResourceBytes =
+  new Trend('ux_resource_bytes');
+
+const BrowserResource2xx =
+  new Counter('ux_resource_2xx');
+
+const BrowserResource3xx =
+  new Counter('ux_resource_3xx');
+
+const BrowserResource4xx =
+  new Counter('ux_resource_4xx');
+
+const BrowserResource5xx =
+  new Counter('ux_resource_5xx');
+
+const BrowserNavigationSuccess =
+  new Counter(
+    'ux_navigation_success'
+  );
+
+const BrowserNavigationFailure =
+  new Counter(
+    'ux_navigation_failure'
+  );
+
+const BrowserDomErrors =
+  new Counter(
+    'ux_dom_errors'
+  );
+  
+// This sample intentionally uses generic placeholders for environment labels,
+// page names, and URLs so the example can be shared safely without a brand name.
+
+// ========================================================
+// 🌍 ENVIRONMENTS — same keys/URLs as k6-protocol-cocacola.js, kept in sync manually.
+// Run with: k6 run -e TARGET_ENV=sample_env_one --out json=raw-browser.json k6-browser-cocacola.js
+// ========================================================
+const ENVIRONMENTS = {
+  sample_env_one: {
+    label: 'Sample Environment One',
+    pages: [
+      { name: 'Homepage', url: 'https://example.com/us/en' },
+      { name: 'BrandsListing', url: 'https://example.com/zz/en/brands' },
+      { name: 'BrandPageOne', url: 'https://example.com/us/en/brands/brand-one' },
+      { name: 'BrandPageTwo', url: 'https://example.com/us/en/brands/brand-two' },
+      { name: 'Sustainability', url: 'https://example.com/zz/en/sustainability' },
+      { name: 'MediaCenter', url: 'https://example.com/us/en/media-center' },
+      { name: 'FAQ', url: 'https://example.com/us/en/about-us/faq' },
+      { name: 'ContactUs', url: 'https://example.com/us/en/about-us/contact-us' },
+    ],
+  },
+
+  sample_env_two: {
+    label: 'Sample Environment Two',
+    pages: [
+      { name: 'Homepage-sample', url: 'https://sampleapp.example.com/' },
+    ],
+  },
+
+  sample_env_three: {
+    label: 'Sample Environment Three',
+    pages: [
+      { name: 'Homepage', url: 'https://example.com/us/en' },
+      { name: 'BrandsListing', url: 'https://example.com/us/en/brands' },
+      { name: 'BrandPageOne', url: 'https://example.com/us/en/brands/brand-one' },
+      { name: 'BrandPageTwo', url: 'https://example.com/us/en/brands/brand-two' },
+      { name: 'Offerings', url: 'https://example.com/us/en/offerings' },
+      { name: 'PlusOneApp', url: 'https://example.com/us/en/offerings/product-app' },
+      { name: 'FAQ', url: 'https://example.com/us/en/about-us/faq' },
+      { name: 'ContactUs', url: 'https://example.com/us/en/about-us/contact-us' },
+    ],
+  },
+};
+
+// Select the active environment from ENVIRONMENTS; if TARGET_ENV is not provided,
+// run every configured environment page from the shared map.
+const ACTIVE_ENV = __ENV.TARGET_ENV || 'all';
+
+let ENV_CONFIG = { label: 'All Environments' };
+let TARGET_PAGES = [];
+
+if (ACTIVE_ENV === 'all') {
+  for (const envName of Object.keys(ENVIRONMENTS)) {
+    const env = ENVIRONMENTS[envName];
+    for (const page of env.pages) {
+      TARGET_PAGES.push({ ...page, envName });
+    }
+  }
+} else {
+  ENV_CONFIG = ENVIRONMENTS[ACTIVE_ENV];
+  if (!ENV_CONFIG) {
+    throw new Error(`Unknown TARGET_ENV "${ACTIVE_ENV}". Valid options: ${Object.keys(ENVIRONMENTS).join(', ')}`);
+  }
+  TARGET_PAGES = ENV_CONFIG.pages;
+}
+
+const BROWSER_CONFIG = {
+  clearCacheAndCookiesPerIteration: true,
+  pageTimeoutSeconds: 30,
+};
+
+export const options = {
+  scenarios: {
+    coca_cola_env_ux_audit: {
+      executor: 'shared-iterations',
+      vus: 1,
+      // Scale sample size to how many pages this environment actually has — no point
+      // running 30 iterations against a 1-page sample app.
+      iterations: Math.max(1, TARGET_PAGES.length * 3),
+      maxDuration: '1m',
+      options: { browser: { type: 'chromium' } },
+    },
+  },
+  thresholds: {
+    ux_web_vital_lcp: ['p(95) < 2500'],
+    ux_web_vital_fcp: ['p(95) < 1500'],
+  },
+};
+
+export default async function () {
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+    screen: { width: 375, height: 812 },
+    viewport: { width: 375, height: 812 },
+  });
+
+  const page = await context.newPage();
+
+  // Every response's HTTP status, keyed by exact request URL. Resource
+  // Timing (below) gives us timing + bytes for each asset but never a
+  // status code, so we join the two by URL after the page settles.
+  const statusByUrl = new Map();
+  page.on('response', (response) => {
+    try {
+      statusByUrl.set(response.url(), response.status());
+    } catch (e) {
+      // malformed/streamed response — status just won't be known for this URL
+    }
+  });
+
+  let selectedPage = null;
+
+  try {
+    if (BROWSER_CONFIG.clearCacheAndCookiesPerIteration) {
+      await context.clearCookies();
+    }
+
+    if (__ITER === 0 && __VU === 1) {
+      console.log(`TARGET_ENV=${ACTIVE_ENV} (${ENV_CONFIG.label}) — ${TARGET_PAGES.length} page(s)`);
+    }
+
+    selectedPage = TARGET_PAGES[__ITER % TARGET_PAGES.length];
+    const envTag = selectedPage.envName || ACTIVE_ENV;
+    page.setDefaultTimeout(BROWSER_CONFIG.pageTimeoutSeconds * 1000);
+
+    console.log(`[UX Runner:${ACTIVE_ENV}] Iteration ${__ITER} -> [${selectedPage.name}]`);
+
+    try {
+      await page.goto(selectedPage.url, { waitUntil: 'networkidle' });
+      BrowserNavigationSuccess.add(1, { url_label: selectedPage.name, env: envTag });
+    } catch (navErr) {
+      BrowserNavigationFailure.add(1, { url_label: selectedPage.name, env: envTag });
+      throw navErr;
+    }
+
+    const performanceMetrics = await page.evaluate(() => {
+      return new Promise((resolve) => {
+        const result = { fcp: 0, lcp: 0, ttfb: 0, tti: 0, cls: 0, pageDuration: 0, resources: [] };
+
+        const paintEntries = performance.getEntriesByType('paint');
+        paintEntries.forEach((entry) => {
+          if (entry.name === 'first-contentful-paint') result.fcp = entry.startTime;
+        });
+
+        const navEntry = performance.getEntriesByType('navigation')[0];
+        result.tti = navEntry ? navEntry.domInteractive : 0;
+        result.pageDuration = navEntry ? navEntry.duration : 0;
+        result.ttfb = navEntry ? Math.max(0, navEntry.responseStart - navEntry.requestStart) : 0;
+
+        let lcpValue = 0;
+        let clsValue = 0;
+
+        try {
+          const lcpObserver = new PerformanceObserver((list) => {
+            const entries = list.getEntries();
+            const last = entries[entries.length - 1];
+            if (last) lcpValue = last.renderTime || last.loadTime || last.startTime;
+          });
+          lcpObserver.observe({ type: 'largest-contentful-paint', buffered: true });
+
+          const clsObserver = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+              if (!entry.hadRecentInput) clsValue += entry.value;
+            }
+          });
+          clsObserver.observe({ type: 'layout-shift', buffered: true });
+        } catch (e) {
+          // entry types unsupported in this context — leave at 0
+        }
+
+        setTimeout(() => {
+          result.lcp = lcpValue || result.fcp;
+          result.cls = clsValue;
+
+          // Every asset the page actually loaded — this is the source of
+          // truth for the "Resources" table. Each entry here becomes
+          // exactly one resource row, never a page.
+          result.resources = performance.getEntriesByType('resource').map((r) => ({
+            name: r.name,
+            initiatorType: r.initiatorType || 'other',
+            duration: r.duration || 0,
+            transferSize: r.transferSize || 0,
+            decodedBodySize: r.decodedBodySize || 0,
+            dns: Math.max(0, (r.domainLookupEnd || 0) - (r.domainLookupStart || 0)),
+            tcp: Math.max(0, (r.connectEnd || 0) - (r.connectStart || 0)),
+            tls: r.secureConnectionStart > 0 ? Math.max(0, (r.connectEnd || 0) - r.secureConnectionStart) : 0,
+            ttfb: Math.max(0, (r.responseStart || 0) - (r.requestStart || 0)),
+            download: Math.max(0, (r.responseEnd || 0) - (r.responseStart || 0)),
+          }));
+
+          resolve(result);
+        }, 500);
+      });
+    });
+
+    WebVitalFCP.add(performanceMetrics.fcp, { url_label: selectedPage.name, env: envTag });
+    WebVitalLCP.add(performanceMetrics.lcp, { url_label: selectedPage.name, env: envTag });
+    WebVitalCLS.add(performanceMetrics.cls, { url_label: selectedPage.name, env: envTag });
+    WebVitalTTFB.add(performanceMetrics.ttfb, { url_label: selectedPage.name, env: envTag });
+    DomInteractive.add(performanceMetrics.tti, { url_label: selectedPage.name, env: envTag });
+    BrowserPageDuration.add(performanceMetrics.pageDuration, { url_label: selectedPage.name, env: envTag });
+
+    // Emit one tagged data point set per captured resource. resource_url is
+    // the join key the report generator groups on — it always carries
+    // url_label too so a resource is unambiguously "this page's resource",
+    // never mistaken for a page of its own.
+    for (const res of performanceMetrics.resources) {
+      let domain = 'unknown';
+      try {
+        domain = new URL(res.name).hostname;
+      } catch (e) {
+        // relative/blob/data URL — leave as 'unknown'
+      }
+
+      const status = statusByUrl.has(res.name) ? statusByUrl.get(res.name) : 0;
+      const tags = {
+        url_label: selectedPage.name,
+        env: envTag,
+        resource_url: res.name,
+        resource_type: res.initiatorType,
+        domain,
+        status: status ? String(status) : 'unknown',
+      };
+
+      BrowserResourceDuration.add(res.duration, tags);
+      BrowserResourceDns.add(res.dns, tags);
+      BrowserResourceTcp.add(res.tcp, tags);
+      BrowserResourceTls.add(res.tls, tags);
+      BrowserResourceTtfb.add(res.ttfb, tags);
+      BrowserResourceDownload.add(res.download, tags);
+      BrowserResourceBytes.add(res.transferSize || res.decodedBodySize || 0, tags);
+
+      if (status >= 200 && status < 300) BrowserResource2xx.add(1, tags);
+      else if (status >= 300 && status < 400) BrowserResource3xx.add(1, tags);
+      else if (status >= 400 && status < 500) BrowserResource4xx.add(1, tags);
+      else if (status >= 500 && status < 600) BrowserResource5xx.add(1, tags);
+    }
+
+    const bodyExists = await page.locator('body').isVisible();
+    check(bodyExists, { 'Mobile DOM container verified': (val) => val === true });
+
+    if (!bodyExists) {
+      BrowserDomErrors.add(1, { url_label: selectedPage.name, env: envTag, type: 'Render_Collapse' });
+    }
+
+    sleep(Math.random() * (5 - 2) + 2);
+  } catch (error) {
+    console.error(`[BROWSER METRIC ERROR]: ${error.message}`);
+    BrowserDomErrors.add(1, {
+      url_label: selectedPage ? selectedPage.name : 'unknown',
+      type: 'Navigation_Timeout',
+    });
+  } finally {
+    await page.close();
+    await context.close();
+  }
+}
+
+// ========================================================
+// Run (pick an environment with -e TARGET_ENV=...):
+//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-browser.json k6-browser-cocacola.js
+//   k6 run -e TARGET_ENV=sample_env_two --out json=raw-browser.json k6-browser-cocacola.js
+//   k6 run -e TARGET_ENV=sample_env_three --out json=raw-browser.json k6-browser-cocacola.js
+//
+//   node report-generator.js --browser=raw-browser.json --out=browser_report.html --profile=<env-name>
+// ========================================================

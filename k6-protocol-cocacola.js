@@ -1,0 +1,470 @@
+import http from 'k6/http';
+import { check, group } from 'k6';
+import exec from 'k6/execution';
+import { Trend, Counter } from 'k6/metrics';
+
+// ========================================================
+// ⚠️  READ BEFORE RUNNING
+// ========================================================
+// This sample is intentionally written with placeholder service/domain names.
+// Replace the sample URLs, page names, and environment keys with your own
+// organization-specific values before using it against any real site.
+// ========================================================
+
+// ========================================================
+// 🌍 ENVIRONMENTS — pick one at runtime, don't hardcode a single target in the body
+// ========================================================
+// Run against a specific environment with:
+//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-protocol.json k6-protocol-cocacola.js
+// Valid TARGET_ENV values are the keys below. Defaults to sample_env_one if not set.
+// Add a new environment by adding a new key here — nothing else in the script changes.
+const ENVIRONMENTS = {
+  sample_env_one: {
+    label: 'Sample Environment One',
+    allowedDomains: ['example.com'],
+    pages: [
+      { name: 'Homepage', url: 'https://example.com/us/en' },
+      { name: 'BrandsListing', url: 'https://example.com/zz/en/brands' },
+      // { name: 'BrandPageOne', url: 'https://example.com/us/en/brands/brand-one' },
+      // { name: 'BrandPageTwo', url: 'https://example.com/us/en/brands/brand-two' },
+      // { name: 'Sustainability', url: 'https://example.com/zz/en/sustainability' },
+      // { name: 'MediaCenter', url: 'https://example.com/us/en/media-center' },
+      // { name: 'FAQ', url: 'https://example.com/us/en/about-us/faq' },
+      // { name: 'ContactUs', url: 'https://example.com/us/en/about-us/contact-us' },
+    ],
+  },
+
+  sample_env_two: {
+    label: 'Sample Environment Two',
+    allowedDomains: ['sampleapp.example.com', 'sdk.example.com'],
+    pages: [
+      { name: 'Homepage-sample', url: 'https://sampleapp.example.com/' },
+    ],
+  },
+
+  sample_env_three: {
+    label: 'Sample Environment Three',
+    allowedDomains: ['example.com'],
+    pages: [
+      { name: 'Homepage-Gamma', url: 'https://example.com/us/en' },
+      // { name: 'BrandsListing', url: 'https://example.com/us/en/brands' },
+      // { name: 'BrandPageOne', url: 'https://example.com/us/en/brands/brand-one' },
+      // { name: 'BrandPageTwo', url: 'https://example.com/us/en/brands/brand-two' },
+      // { name: 'Offerings', url: 'https://example.com/us/en/offerings' },
+      // { name: 'PlusOneApp', url: 'https://example.com/us/en/offerings/product-app' },
+      { name: 'FAQ', url: 'https://example.com/us/en/about-us/faq' },
+      { name: 'ContactUs', url: 'https://example.com/us/en/about-us/contact-us' },
+    ],
+  },
+};
+
+function parseTargetEnvironments(rawTargetEnv) {
+  const normalized = (rawTargetEnv || 'all').trim().toLowerCase();
+  if (!normalized || normalized === 'all' || normalized === '*') {
+    return Object.keys(ENVIRONMENTS);
+  }
+
+  const envNames = normalized.split(',').map((env) => env.trim()).filter(Boolean);
+  const selected = [];
+  for (const envName of envNames) {
+    if (!ENVIRONMENTS[envName]) {
+      throw new Error(`Unknown TARGET_ENV "${envName}". Valid options: ${Object.keys(ENVIRONMENTS).join(', ')} or all`);
+    }
+    selected.push(envName);
+  }
+
+  return selected;
+}
+
+const ACTIVE_ENV_NAMES = parseTargetEnvironments(__ENV.TARGET_ENV);
+const ENV_CONFIG = ACTIVE_ENV_NAMES.map((envName) => ENVIRONMENTS[envName]);
+
+const TARGET_PAGES = ACTIVE_ENV_NAMES.flatMap((envName) =>
+  ENVIRONMENTS[envName].pages.map((page) => ({
+    ...page,
+    envName,
+    envLabel: ENVIRONMENTS[envName].label,
+    key: `${envName}.${page.name}`,
+  })))
+
+const GLOBAL_CONFIG = {
+  newUserRatio: 0.20,
+  cookiesOffRatio: 0.00,
+  failTransactionOnAssetFailure: false,
+  assetFailurePolicy: 'warning',
+
+  dnsTTL: '10s',
+  resourceValidationRatio: 0.20,
+
+  allowedDomains: Array.from(new Set([
+    ...ACTIVE_ENV_NAMES.flatMap((envName) => ENVIRONMENTS[envName].allowedDomains),
+    'example.com',
+    'example.net',
+    'example.org',
+    'sampleapp.example.com',
+    'sdk.example.com',
+  ])),
+  excludedDomains: [
+    'googletagmanager.com',
+    'google-analytics.com',
+    'doubleclick.net',
+    'gstatic.com',        // Google static assets example
+    'recaptcha.net',
+    'cookielaw.org',      // Consent script/CDN example
+  ],
+  allowedExtensions: ['.js', '.css', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.woff2', '.ico', '.json', '.html'],
+};
+
+const STAGES = [
+  { target: 1, duration: '1m', label: 'phase_1_1tps' },
+  { target: 2, duration: '1m', label: 'phase_2_2tps' },
+  { target: 5, duration: '1m', label: 'phase_3_5tps' },
+  { target: 10, duration: '1m', label: 'phase_4_10tps' },
+  { target: 100, duration: '2m', label: 'phase_5_100tps' },
+  { target: 1000, duration: '2m', label: 'phase_6_1000tps' },
+  { target: 5000, duration: '2m', label: 'phase_7_5000tps' },
+  { target: 10000, duration: '2m', label: 'phase_8_10000tps' },
+];
+
+// ========================================================
+// 📊 RUNTIME OPTIONS
+// ========================================================
+export const options = {
+  scenarios: {
+    returning_users: {
+      executor: 'ramping-arrival-rate',
+      startRate: 0,
+      timeUnit: '1s',
+      preAllocatedVUs: 50,
+      maxVUs: 5000,
+      stages: STAGES.map((s) => ({ target: Math.round(s.target * 0.80), duration: s.duration })),
+    },
+    new_users: {
+      executor: 'ramping-arrival-rate',
+      startRate: 0,
+      timeUnit: '1s',
+      preAllocatedVUs: 50,
+      maxVUs: 5000,
+      stages: STAGES.map((s) => ({ target: Math.round(s.target * 0.20), duration: s.duration })),
+    },
+  },
+  dns: { ttl: GLOBAL_CONFIG.dnsTTL, select: 'roundRobin', policy: 'preferIPv4' },
+  discardResponseBodies: true,
+};
+
+// ========================================================
+// 📈 CUSTOM METRICS
+// ========================================================
+const RespTime = new Trend('resp_time_ms');
+const DnsTime = new Trend('dns_time_ms');
+const ConnectTime = new Trend('connect_time_ms');
+const TlsTime = new Trend('tls_time_ms');
+const TtfbTime = new Trend('ttfb_ms');
+const DownloadTime = new Trend('download_time_ms');
+const FullPageTime = new Trend('full_page_time_ms');
+
+const PageTotal = new Counter('page_total');
+const PagePassed = new Counter('page_passed');
+const PageFailed = new Counter('page_failed');
+const Page2xx = new Counter('page_2xx');
+const Page3xx = new Counter('page_3xx');
+const Page4xx = new Counter('page_4xx');
+const Page5xx = new Counter('page_5xx');
+const ResourceTotal = new Counter('resource_total');
+const ResourcePassed = new Counter('resource_passed');
+const ResourceFailed = new Counter('resource_failed');
+const Resource2xx = new Counter('resource_2xx');
+const Resource3xx = new Counter('resource_3xx');
+const Resource4xx = new Counter('resource_4xx');
+const Resource5xx = new Counter('resource_5xx');
+
+const HomepageRequests = new Counter('homepage_requests');
+const FAQRequests = new Counter('faq_requests');
+const ContactUsRequests = new Counter('contactus_requests');
+
+const EmbeddedFetchAttempts = new Counter('embedded_fetch_attempts');
+const EmbeddedFetchFailures = new Counter('embedded_fetch_failures');
+const ErrorEvents = new Counter('error_events');
+const NewUserTransactions = new Counter('new_user_transactions');
+const ReturningUserTransactions = new Counter('returning_user_transactions');
+
+const Status2xx = new Counter('status_2xx');
+const Status3xx = new Counter('status_3xx');
+const Status4xx = new Counter('status_4xx');
+const Status5xx = new Counter('status_5xx');
+const Status403 = new Counter('status_403');
+const Status404 = new Counter('status_404');
+const Status429 = new Counter('status_429');
+const NetworkErrors = new Counter('network_errors');
+
+const baseParams = { headers: { 'Accept-Encoding': 'gzip, deflate, br', 'Connection': 'keep-alive' } };
+
+const TEST_START_MS = Date.now();
+
+function parseDurationMs(str) {
+  const m = /^(\d+)([smh])$/.exec(str);
+  if (!m) return 0;
+  const n = Number(m[1]);
+  return m[2] === 's' ? n * 1000 : m[2] === 'm' ? n * 60000 : n * 3600000;
+}
+
+const STAGE_BOUNDARIES_MS = (() => {
+  let cumulative = 0;
+  return STAGES.map((s) => {
+    cumulative += parseDurationMs(s.duration);
+    return cumulative;
+  });
+})();
+
+function currentStageLabel() {
+  const elapsed = Date.now() - TEST_START_MS;
+  for (let i = 0; i < STAGE_BOUNDARIES_MS.length; i++) {
+    if (elapsed <= STAGE_BOUNDARIES_MS[i]) return STAGES[i].label;
+  }
+  return STAGES[STAGES.length - 1].label;
+}
+
+function responseErrorTrace(resourceType, label, expectedStatus, receivedStatus, receivedError, receivedBodySnippet, phase, transaction, url, userType, resourceUrl) {
+  const reason = receivedError || 'non-200 response';
+  const bodySnippet = receivedBodySnippet ? ` body=${String(receivedBodySnippet).slice(0, 80)}` : '';
+  return `${resourceType} ${label}: received HTTP ${receivedStatus}. reason=${reason}${bodySnippet}. phase=${phase}. transaction=${transaction}. url=${url}. user_type=${userType}. resource_url=${resourceUrl}. expected=${expectedStatus}`;
+}
+
+// ========================================================
+// 🔍 SETUP: ONE-TIME ASSET DISCOVERY
+// ========================================================
+export function setup() {
+  console.log(`TARGET_ENV=${ACTIVE_ENV_NAMES.join(',')} (${ACTIVE_ENV_NAMES.map((name) => ENVIRONMENTS[name].label).join(' + ')})`);
+
+  const discoveredMap = {};
+
+  for (const page of TARGET_PAGES) {
+    const domainsSeen = new Map();
+    const assets = [];
+
+    const res = http.get(page.url, { headers: baseParams.headers, responseType: 'text', tags: { stage: 'setup' } });
+
+    if (res.status === 200 && res.body) {
+      const urlRegex = /(?:src|href)=["']([^"']+)["']/g;
+      let match;
+      while ((match = urlRegex.exec(res.body)) !== null) {
+        let assetUrl = match[1];
+
+        if (!assetUrl.startsWith('http://') && !assetUrl.startsWith('https://')) {
+          if (assetUrl.startsWith('//')) {
+            assetUrl = 'https:' + assetUrl;
+          } else if (assetUrl.startsWith('#')) {
+            continue; // in-page anchors, not requests
+          } else {
+            const base = page.url.endsWith('/') ? page.url.slice(0, -1) : page.url;
+            assetUrl = base + (assetUrl.startsWith('/') ? '' : '/') + assetUrl;
+          }
+        }
+
+        try {
+          const parts = assetUrl.split('/');
+          const hostname = parts[2] || '';
+          const filename = (parts[parts.length - 1] || '').split('?')[0];
+          const ext = filename.toLowerCase();
+
+          let kept = GLOBAL_CONFIG.allowedDomains.some((d) => hostname.includes(d) || d.includes(hostname));
+          let reason = kept ? 'domain allow-listed' : 'domain not in allow-list';
+
+          if (kept && GLOBAL_CONFIG.excludedDomains.some((d) => hostname.includes(d))) {
+            kept = false;
+            reason = 'domain explicitly excluded';
+          }
+          if (kept && !GLOBAL_CONFIG.allowedExtensions.some((e) => ext.endsWith(e) || ext === '')) {
+            kept = false;
+            reason = 'extension not in allow-list';
+          }
+
+          if (!domainsSeen.has(hostname)) domainsSeen.set(hostname, { domain: hostname, kept, reason });
+          if (kept && !assets.includes(assetUrl)) assets.push(assetUrl);
+        } catch (e) {
+          // skip unparseable asset URLs
+        }
+      }
+    }
+
+    discoveredMap[page.key] = { assets, domains: [...domainsSeen.values()], envName: page.envName, envLabel: page.envLabel };
+  }
+
+  console.log('DISCOVERY_JSON=' + JSON.stringify(discoveredMap));
+  return { pageMap: discoveredMap };
+}
+
+// ========================================================
+// 🚀 DEFAULT FUNCTION
+// ========================================================
+export default function (data) {
+  const scenarioName = exec.scenario.name;
+  const isNewUser = scenarioName === 'new_users';
+  const isReturningUser = scenarioName === 'returning_users';
+
+  const userType = isNewUser ? 'new' : 'returning';
+  const stage = currentStageLabel();
+  const cacheState = isNewUser ? 'cache_disabled' : 'cache_enabled';
+
+  const pageKeys = Object.keys(data.pageMap);
+  const selectedPageKey = pageKeys[Math.floor(Math.random() * pageKeys.length)];
+  const pageData = data.pageMap[selectedPageKey];
+  const pageMeta = TARGET_PAGES.find((p) => p.key === selectedPageKey);
+  const pageUrl = pageMeta.url;
+  const selectedPageName = pageMeta.name;
+  const selectedEnvName = pageMeta.envName;
+
+  if (selectedPageName === 'Homepage-Gamma') HomepageRequests.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+  else if (selectedPageName === 'FAQ') FAQRequests.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+  else if (selectedPageName === 'ContactUs') ContactUsRequests.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+
+  if (isNewUser) {
+    NewUserTransactions.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+  } else if (isReturningUser) {
+    ReturningUserTransactions.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+  }
+
+  const requestParams = {
+    headers: Object.assign({}, baseParams.headers),
+    tags: { name: `${selectedPageKey}_HTML` },
+  };
+
+  if (isNewUser) {
+    requestParams.jar = new http.CookieJar();
+  } else {
+    requestParams.jar = http.cookieJar();
+  }
+
+  const iterationStartMs = Date.now();
+  let assetsFetchedThisIteration = false;
+
+  group(selectedPageName, function () {
+    const res = http.get(pageUrl, requestParams);
+    const t = res.timings;
+
+    const dnsTiming = t.blocked || 0;
+
+    RespTime.add(t.duration, { resource: 'page', url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    DnsTime.add(dnsTiming, { resource: 'page', url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    ConnectTime.add(t.connecting, { resource: 'page', url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    TlsTime.add(t.tls_handshaking, { resource: 'page', url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    TtfbTime.add(t.waiting, { resource: 'page', url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    DownloadTime.add(t.receiving, { resource: 'page', url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+
+    PageTotal.add(1, { url_label: selectedPageName, stage, cache_state: cacheState, env_name: selectedEnvName, user_type: userType });
+
+    if (res.status >= 200 && res.status < 300) {
+      Page2xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+      Status2xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    } else if (res.status >= 300 && res.status < 400) {
+      Page3xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+      Status3xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    } else if (res.status >= 400 && res.status < 500) {
+      Page4xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+      Status4xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    } else if (res.status >= 500) {
+      Page5xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+      Status5xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    }
+
+    if (res.status === 403) Status403.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    if (res.status === 404) Status404.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    if (res.status === 429) Status429.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+
+    if (res.error) {
+      NetworkErrors.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType, resource_url: pageUrl, error_type: res.error });
+      ErrorEvents.add(1, { resource: 'page', code: String(res.status || 'network'), desc: responseErrorTrace('page', selectedPageName, 'HTTP 200', String(res.status || 'network'), res.error || 'network error', '', stage, selectedPageName, pageUrl, userType, pageUrl), url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+    }
+
+    const ok = check(res, { 'HTML request returned HTTP 200': (r) => r.status === 200 });
+    if (ok) {
+      PagePassed.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+    } else {
+      PageFailed.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+      ErrorEvents.add(1, { resource: 'page', code: String(res.status), desc: responseErrorTrace('page', selectedPageName, 'HTTP 200', String(res.status), res.error || 'non-200 response', '', stage, selectedPageName, pageUrl, userType, pageUrl), url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+    }
+
+    if (Math.random() < GLOBAL_CONFIG.resourceValidationRatio && pageData.assets.length > 0) {
+      assetsFetchedThisIteration = true;
+      group('Embedded Resources', function () {
+        EmbeddedFetchAttempts.add(1, { env_name: selectedEnvName, url_label: selectedPageName, stage, user_type: userType });
+
+        const batchRequests = pageData.assets.map((assetUrl) => {
+          const assetParams = {
+            headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+            tags: { name: `${selectedPageKey}_Asset_Download` },
+            jar: requestParams.jar,
+          };
+          return ['GET', assetUrl, null, assetParams];
+        });
+
+        const assetResponses = http.batch(batchRequests);
+        let allAssetsPassed = true;
+
+        assetResponses.forEach((assetRes) => {
+          ResourceTotal.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+          if (assetRes.status >= 200 && assetRes.status < 300) {
+            Resource2xx.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            ResourcePassed.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            Status2xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+          } else if (assetRes.status >= 300 && assetRes.status < 400) {
+            Resource3xx.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            Status3xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+            allAssetsPassed = false;
+            ResourceFailed.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            EmbeddedFetchFailures.add(1, { env_name: selectedEnvName, url_label: selectedPageName, stage, user_type: userType, status_code: String(assetRes.status) });
+            ErrorEvents.add(1, { resource: 'asset', code: String(assetRes.status), desc: responseErrorTrace('asset', assetRes.url || selectedPageName, 'HTTP 200', String(assetRes.status), assetRes.error || 'non-200 response', '', stage, selectedPageName, pageUrl, userType, assetRes.url || selectedPageName), url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+          } else if (assetRes.status >= 400 && assetRes.status < 500) {
+            Resource4xx.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            Status4xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+            allAssetsPassed = false;
+            ResourceFailed.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            EmbeddedFetchFailures.add(1, { env_name: selectedEnvName, url_label: selectedPageName, stage, user_type: userType, status_code: String(assetRes.status) });
+            ErrorEvents.add(1, { resource: 'asset', code: String(assetRes.status), desc: responseErrorTrace('asset', assetRes.url || selectedPageName, 'HTTP 200', String(assetRes.status), assetRes.error || 'non-200 response', '', stage, selectedPageName, pageUrl, userType, assetRes.url || selectedPageName), url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            if (assetRes.status === 403) Status403.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+            if (assetRes.status === 404) Status404.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+            if (assetRes.status === 429) Status429.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+          } else if (assetRes.status >= 500) {
+            Resource5xx.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            Status5xx.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType });
+            allAssetsPassed = false;
+            ResourceFailed.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            EmbeddedFetchFailures.add(1, { env_name: selectedEnvName, url_label: selectedPageName, stage, user_type: userType, status_code: String(assetRes.status) });
+            ErrorEvents.add(1, { resource: 'asset', code: String(assetRes.status), desc: responseErrorTrace('asset', assetRes.url || selectedPageName, 'HTTP 200', String(assetRes.status), assetRes.error || 'non-200 response', '', stage, selectedPageName, pageUrl, userType, assetRes.url || selectedPageName), url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+          } else {
+            allAssetsPassed = false;
+            ResourceFailed.add(1, { url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+            EmbeddedFetchFailures.add(1, { env_name: selectedEnvName, url_label: selectedPageName, stage, user_type: userType, status_code: String(assetRes.status || 'network') });
+            ErrorEvents.add(1, { resource: 'asset', code: String(assetRes.status || 'network'), desc: responseErrorTrace('asset', assetRes.url || selectedPageName, 'HTTP 200', String(assetRes.status || 'network'), assetRes.error || 'non-200 response', '', stage, selectedPageName, pageUrl, userType, assetRes.url || selectedPageName), url_label: selectedPageName, env_name: selectedEnvName, stage, user_type: userType });
+          }
+
+          if (assetRes.error) {
+            NetworkErrors.add(1, { url_label: selectedPageName, stage, env_name: selectedEnvName, user_type: userType, resource_url: assetRes.url || selectedPageName, error_type: assetRes.error });
+          }
+        });
+
+        if (GLOBAL_CONFIG.failTransactionOnAssetFailure) {
+          check(allAssetsPassed, { 'All embedded assets verified 200': (passed) => passed === true });
+        }
+      });
+    }
+  });
+
+  const fullDurationMs = Date.now() - iterationStartMs;
+  FullPageTime.add(fullDurationMs, {
+    url_label: selectedPageName,
+    stage,
+    assets_fetched: assetsFetchedThisIteration ? 'true' : 'false',
+    env_name: selectedEnvName,
+    user_type: userType,
+  });
+}
+
+// ========================================================
+// Run (pick an environment with -e TARGET_ENV=...):
+//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-protocol.json k6-protocol-cocacola.js | tee k6-protocol.log
+//   k6 run -e TARGET_ENV=sample_env_two --out json=raw-protocol.json k6-protocol-cocacola.js | tee k6-protocol.log
+//   k6 run -e TARGET_ENV=sample_env_three --out json=raw-protocol.json k6-protocol-cocacola.js | tee k6-protocol.log
+//
+//   node report-generator.js --protocol=raw-protocol.json --log=k6-protocol.log --out=protocol_report.html --profile=<env-name>
+// ========================================================

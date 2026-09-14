@@ -1,0 +1,41 @@
+
+import json
+import re
+from urllib.parse import urlparse
+
+har_file = "web.com.har"
+
+
+with open(har_file, encoding="utf-8") as f:
+    har = json.load(f)
+
+domains = set()
+
+# URL/domain pattern
+url_re = re.compile(
+    r'https?://(?:\\?/|/)*'
+    r'([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+    re.I
+)
+
+for entry in har["log"]["entries"]:
+
+    # 1. Actual network request
+    url = entry.get("request", {}).get("url", "")
+    host = urlparse(url).hostname
+
+    if host:
+        domains.add(host.lower())
+
+    # 2. URLs embedded in response body
+    content = entry.get("response", {}).get("content", {})
+    text = content.get("text", "")
+
+    if text:
+        for host in url_re.findall(text):
+            domains.add(host.lower())
+
+for domain in sorted(domains):
+    print(domain)
+
+print(f"\nTotal unique domains: {len(domains)}")
