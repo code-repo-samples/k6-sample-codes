@@ -15,7 +15,7 @@ import { Trend, Counter } from 'k6/metrics';
 // 🌍 ENVIRONMENTS — pick one at runtime, don't hardcode a single target in the body
 // ========================================================
 // Run against a specific environment with:
-//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-protocol.json k6-protocol-cocacola.js
+//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-protocol.json k6-protocol.js
 // Valid TARGET_ENV values are the keys below. Defaults to sample_env_one if not set.
 // Add a new environment by adding a new key here — nothing else in the script changes.
 const ENVIRONMENTS = {
@@ -462,9 +462,9 @@ export default function (data) {
 
 // ========================================================
 // Run (pick an environment with -e TARGET_ENV=...):
-//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-protocol.json k6-protocol-cocacola.js | tee k6-protocol.log
-//   k6 run -e TARGET_ENV=sample_env_two --out json=raw-protocol.json k6-protocol-cocacola.js | tee k6-protocol.log
-//   k6 run -e TARGET_ENV=sample_env_three --out json=raw-protocol.json k6-protocol-cocacola.js | tee k6-protocol.log
+//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-protocol.json k6-protocol.js | tee k6-protocol.log
+//   k6 run -e TARGET_ENV=sample_env_two --out json=raw-protocol.json k6-protocol.js | tee k6-protocol.log
+//   k6 run -e TARGET_ENV=sample_env_three --out json=raw-protocol.json k6-protocol.js | tee k6-protocol.log
 //
 //   node report-generator.js --protocol=raw-protocol.json --log=k6-protocol.log --out=protocol_report.html --profile=<env-name>
 // ========================================================
