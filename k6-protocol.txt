@@ -110,11 +110,30 @@ const GLOBAL_CONFIG = {
     'doubleclick.net',
     'gstatic.com',        // Google static assets example
     'recaptcha.net',
-    'cookielaw.org',      // Consent script/CDN example
+    'cooke.org',      // Consent script/CDN example
   ],
   allowedExtensions: ['.js', '.css', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.woff2', '.ico', '.json', '.html'],
 };
 
+// //constant
+// const STAGES = [
+//   { target: 100,  duration: '2m',  label: 'phase_1_ramp_100tps' },
+//   { target: 1000, duration: '3m',  label: 'phase_2_ramp_1000tps' },
+//   { target: 1000, duration: '30m', label: 'phase_3_constant_1000tps' },
+//   { target: 0,    duration: '3m',  label: 'phase_4_ramp_down' },
+// ];
+
+// //Spike
+// const STAGES = [
+//   { target: 100,  duration: '5m',  label: 'phase_1_baseline_100tps' },
+//   { target: 5000, duration: '10s', label: 'phase_2_spike_5000tps' },
+//   { target: 5000, duration: '2m',  label: 'phase_3_sustain_spike_5000tps' },
+//   { target: 100,  duration: '10s', label: 'phase_4_recovery_100tps' },
+//   { target: 100,  duration: '5m',  label: 'phase_5_recovery_validation' },
+//   { target: 0,    duration: '2m',  label: 'phase_6_ramp_down' },
+// ];
+
+//stress
 const STAGES = [
   { target: 1, duration: '1m', label: 'phase_1_1tps' },
   { target: 2, duration: '1m', label: 'phase_2_2tps' },
@@ -125,6 +144,56 @@ const STAGES = [
   { target: 5000, duration: '2m', label: 'phase_7_5000tps' },
   { target: 10000, duration: '2m', label: 'phase_8_10000tps' },
 ];
+
+
+// const LOAD_PROFILES = {
+
+//   stress: [
+//     { target: 1,     duration: '1m', label: '1tps' },
+//     { target: 2,     duration: '1m', label: '2tps' },
+//     { target: 5,     duration: '1m', label: '5tps' },
+//     { target: 10,    duration: '1m', label: '10tps' },
+//     { target: 100,   duration: '2m', label: '100tps' },
+//     { target: 1000,  duration: '2m', label: '1000tps' },
+//     { target: 5000,  duration: '2m', label: '5000tps' },
+//     { target: 10000, duration: '2m', label: '10000tps' },
+//   ],
+
+//   constant: [
+//     { target: 100,  duration: '2m',  label: 'ramp_100tps' },
+//     { target: 1000, duration: '3m',  label: 'ramp_1000tps' },
+//     { target: 1000, duration: '30m', label: 'constant_1000tps' },
+//     { target: 0,    duration: '3m',  label: 'ramp_down' },
+//   ],
+
+//   spike: [
+//     { target: 100,  duration: '5m',  label: 'baseline_100tps' },
+//     { target: 5000, duration: '10s', label: 'spike_5000tps' },
+//     { target: 5000, duration: '2m',  label: 'sustain_5000tps' },
+//     { target: 100,  duration: '10s', label: 'recovery_100tps' },
+//     { target: 100,  duration: '5m',  label: 'recovery_validation' },
+//     { target: 0,    duration: '2m',  label: 'ramp_down' },
+//   ],
+// };
+
+// const STAGES = LOAD_PROFILES.stress;
+// const STAGES = LOAD_PROFILES.constant;
+// const STAGES = LOAD_PROFILES.spike;
+
+// const LOAD_PROFILE = __ENV.LOAD_PROFILE || 'stress';
+
+// if (!LOAD_PROFILES[LOAD_PROFILE]) {
+//   throw new Error(
+//     `Invalid LOAD_PROFILE="${LOAD_PROFILE}". ` +
+//     `Valid profiles: ${Object.keys(LOAD_PROFILES).join(', ')}`
+//   );
+// }
+
+// const STAGES = LOAD_PROFILES[LOAD_PROFILE];
+// k6 run \
+//   -e LOAD_PROFILE=stress \
+//   -e TARGET_ENV=nonp \
+//   k6-protocol.js
 
 // ========================================================
 // 📊 RUNTIME OPTIONS
