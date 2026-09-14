@@ -87,8 +87,8 @@ const BrowserDomErrors =
 // page names, and URLs so the example can be shared safely without a brand name.
 
 // ========================================================
-// 🌍 ENVIRONMENTS — same keys/URLs as k6-protocol-cocacola.js, kept in sync manually.
-// Run with: k6 run -e TARGET_ENV=sample_env_one --out json=raw-browser.json k6-browser-cocacola.js
+// 🌍 ENVIRONMENTS — same keys/URLs as k6-protocol.js, kept in sync manually.
+// Run with: k6 run -e TARGET_ENV=sample_env_one --out json=raw-browser.json k6-browser.js
 // ========================================================
 const ENVIRONMENTS = {
   sample_env_one: {
@@ -343,9 +343,9 @@ export default async function () {
 
 // ========================================================
 // Run (pick an environment with -e TARGET_ENV=...):
-//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-browser.json k6-browser-cocacola.js
-//   k6 run -e TARGET_ENV=sample_env_two --out json=raw-browser.json k6-browser-cocacola.js
-//   k6 run -e TARGET_ENV=sample_env_three --out json=raw-browser.json k6-browser-cocacola.js
+//   k6 run -e TARGET_ENV=sample_env_one --out json=raw-browser.json k6-browser.js
+//   k6 run -e TARGET_ENV=sample_env_two --out json=raw-browser.json k6-browser.js
+//   k6 run -e TARGET_ENV=sample_env_three --out json=raw-browser.json k6-browser.js
 //
 //   node report-generator.js --browser=raw-browser.json --out=browser_report.html --profile=<env-name>
 // ========================================================
