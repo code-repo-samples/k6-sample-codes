@@ -1,0 +1,5567 @@
+/**
+ * =============================================================================
+ * High-Throughput k6 Performance Testing Framework
+ * =============================================================================
+ *
+ * REPORT STRUCTURE
+ * ----------------
+ *
+ * 1. Overall Summary
+ *
+ * 2. Phase-wise Breakdown
+ *      Phase
+ *        - Target TPS
+ *        - Actual TPS
+ *        - Requests
+ *        - Dropped iterations
+ *        - Error %
+ *        - Status
+ *
+ *
+ *          Each page:
+ *            Count
+ *            Avg
+ *            P90
+ *            P95
+ *            P99
+ *            Max
+ *            2xx
+ *            3xx
+ *            4xx
+ *            5xx
+ *            Error %
+ *
+ * 3. Cache / Backend Breakdown
+ *
+ * 4. Overall HTTP Status Distribution
+ *
+ * 5. Native k6 Metrics
+ *
+ * SCALABILITY
+ * -----------
+ * No per-request arrays.
+ * No per-request logging.
+ * No response-body retention.
+ * No per-request report objects.
+ *
+ * Reporting remains O(phases x URLs), not O(requests).
+ *
+ * =============================================================================
+ */
+
+import http from 'k6/http';
+import { Counter, Trend } from 'k6/metrics';
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.1.0/index.js';
+
+// =============================================================================
+// 1. CONFIGURATION
+// =============================================================================
+
+const CONFIG = {
+
+    testType: 'stress',
+
+    // Used for automatic VU sizing.
+    // VUs ~= target TPS * expected average latency.
+    expectedLatencySec: 0.3,
+
+    // ---------------------------------------------------------------------------
+    // LOAD PHASES
+    // ---------------------------------------------------------------------------
+    //
+    // Add/change phases here only.
+    //
+    // Example:
+    //
+    // { name: 'phase_1tps', targetTPS: 1, duration: '1m' }
+    //
+    // High-throughput example:
+    //
+    // { name: 'phase_10000tps', targetTPS: 10000, duration: '10m' }
+    //
+    // The reporting automatically follows the configured phases.
+    // ---------------------------------------------------------------------------
+
+    phases: [
+        { name: 'phase_4tps', targetTPS: 4, duration: '5s' },
+        { name: 'phase_10tps', targetTPS: 10, duration: '5s' },
+        { name: 'phase_20tps', targetTPS: 20, duration: '5s' },
+        { name: 'phase_50tps', targetTPS: 5, duration: '5s' },
+
+        // Example:
+        // { name: 'steady_10000tps', targetTPS: 10000, duration: '1h' },
+    ],
+
+    // ---------------------------------------------------------------------------
+    // PAGES / URLS
+    // ---------------------------------------------------------------------------
+    //
+    // These are the pages that appear INSIDE every phase.
+    //
+    // Weights determine request distribution.
+    //
+    // Example below uses your three Gamma pages.
+    // ---------------------------------------------------------------------------
+
+    urls: [
+        {
+            id: 'homepage',
+            name: 'Homepage',
+            url: 'http://localhost:8000/page1',
+            method: 'GET',
+            weight: 1,
+            provider: 'gcp-cdn',
+        },
+
+        {
+            id: 'faq',
+            name: 'FAQ',
+            url: 'http://localhost:8000/page2',
+            method: 'GET',
+            weight: 1,
+            provider: 'gcp-cdn',
+        },
+
+        {
+            id: 'contactus',
+            name: 'ContactUs',
+            url: 'http://localhost:8000/page3',
+            method: 'GET',
+            weight: 1,
+            provider: 'gcp-cdn',
+        },
+    ],
+
+    // ---------------------------------------------------------------------------
+    // CACHE / CDN HEADER CONFIGURATION
+    // ---------------------------------------------------------------------------
+    cacheHeaders: {
+        statusHeaders: [
+            'X-Cache',
+            'X-Cache-Status',
+            'CF-Cache-Status',
+            'X-Cache-Hit',
+        ],
+        ageHeader: 'Age',
+        backendHeader: 'response_sent_by_backend',
+        cacheResponseHeader: 'response_from_cache',
+    },
+
+    // ---------------------------------------------------------------------------
+    // REPORTING
+    // ---------------------------------------------------------------------------
+
+    reporting: {
+        maxErrorRatePct: 10.0,
+        minTpsAchievementPct: 90.0,
+    },
+};
+
+// =============================================================================
+// 2. STATUS CODE CLASSIFICATION
+// =============================================================================
+
+const STATUS_CLASSES = [
+    '2xx',
+    '3xx',
+    '4xx',
+    '5xx',
+    'err',
+];
+
+// =============================================================================
+// 2b. NATIVE NETWORK METRICS (reused, not custom)
+// =============================================================================
+//
+// These are metrics k6 already collects for every HTTP request, regardless
+// of whether we read them. We are not adding any new instrumentation or
+// per-request work here -- we are only registering bounded, phase-scoped
+// threshold submetrics (one series per phase per metric, NOT per page) so
+// handleSummary() can pull them back out. This mirrors the existing
+// http_reqs / http_req_duration pattern used elsewhere in this file.
+// =============================================================================
+
+const NETWORK_TREND_METRICS = [
+    { key: 'http_req_blocked', label: 'Blocked (waiting for TCP/TLS connection slot)' },
+    { key: 'http_req_connecting', label: 'Connecting (TCP handshake)' },
+    { key: 'http_req_tls_handshaking', label: 'TLS Handshaking' },
+    { key: 'http_req_sending', label: 'Sending' },
+    { key: 'http_req_waiting', label: 'Waiting (TTFB)' },
+    { key: 'http_req_receiving', label: 'Receiving' },
+];
+
+function statusClass(status) {
+    if (status === 0) return 'err';
+    if (status < 300) return '2xx';
+    if (status < 400) return '3xx';
+    if (status < 500) return '4xx';
+    return '5xx';
+}
+
+// Treat 4xx / 5xx as failed HTTP requests.
+http.setResponseCallback(
+    http.expectedStatuses({
+        min: 200,
+        max: 399,
+    })
+);
+
+// =============================================================================
+// 3. CACHE STRATEGY
+// =============================================================================
+
+const CACHE_STRATEGY = {
+    'aws-cloudfront': 'header',
+    'cdn-header': 'header',
+    'gcp-cdn': 'header', //'not-observable',
+    'direct-bucket': 'not-applicable',
+};
+
+// =============================================================================
+// 4. URL WEIGHT TABLE
+// =============================================================================
+//
+// Built once during initialization.
+// No table construction occurs inside runTest().
+// =============================================================================
+
+const URL_TABLE = (function buildUrlTable(urls) {
+
+    const total = urls.reduce(
+        (sum, u) => sum + u.weight,
+        0
+    );
+
+    let cumulative = 0;
+    return urls.map((u) => {
+        cumulative += u.weight;
+        return {
+            ...u,
+            cumWeight: cumulative / total,
+        };
+    });
+
+})(CONFIG.urls);
+
+
+// function to pick a URL based on weights
+function pickUrl() {
+    const r = Math.random();
+    for (let i = 0; i < URL_TABLE.length; i++) {
+        if (r <= URL_TABLE[i].cumWeight) {
+            return URL_TABLE[i];
+        }
+    }
+
+    return URL_TABLE[URL_TABLE.length - 1];
+}
+
+// =============================================================================
+// 5. CUSTOM AGGREGATE METRICS
+// =============================================================================
+//
+// These metrics are aggregate metrics only.
+//
+// IMPORTANT:
+// There is NO per-request array.
+// There is NO per-request object retained.
+// =============================================================================
+
+const statusClassCount =
+    new Counter('status_class_count');
+
+const cacheHitCount =
+    new Counter('cache_hit_count');
+
+const cacheMissCount =
+    new Counter('cache_miss_count');
+
+const cacheUnknownCount =
+    new Counter('cache_unknown_count');
+
+const cacheNotObservableCount =
+    new Counter('cache_not_observable_count');
+
+const cacheNotApplicableCount =
+    new Counter('cache_not_applicable_count');
+
+const cacheAge =
+    new Trend('cache_age', true);
+
+const backendResponseCount =
+    new Counter('backend_response_count');
+
+const cacheResponseCount =
+    new Counter('cache_response_count');
+
+// =============================================================================
+// 6. DURATION PARSING
+// =============================================================================
+
+function parseDurationToSeconds(dur) {
+    const re = /(\d+)\s*(h|m|s)/g;
+    let match, totalSeconds = 0, found = false;
+
+    while ((match = re.exec(dur)) !== null) {
+        found = true;
+        const value = parseInt(match[1], 10);
+        const unit = match[2];
+
+        if (unit === 'h') totalSeconds += value * 3600;
+        else if (unit === 'm') totalSeconds += value * 60;
+        else totalSeconds += value;
+    }
+
+    if (!found) throw new Error(`Cannot parse duration: ${dur}`);
+    return totalSeconds;
+}
+
+// =============================================================================
+// 7. SCENARIOS
+// =============================================================================
+//
+// One constant-arrival-rate scenario per phase.
+//
+// Phases are scheduled back-to-back.
+//
+// The scenario name becomes the automatic `scenario` metric tag.
+// =============================================================================
+
+function buildScenarios(config) {
+    const scenarios = {};
+    let cumulativeStartSeconds = 0;
+    config.phases.forEach((phase) => {
+        const durationSeconds =
+            parseDurationToSeconds(phase.duration);
+        const preAllocatedVUs =
+            phase.preAllocatedVUs ||
+            Math.max(
+                10,
+                Math.ceil(
+                    phase.targetTPS *
+                    config.expectedLatencySec
+                )
+            );
+
+        const maxVUs =
+            phase.maxVUs ||
+            preAllocatedVUs * 3;
+
+        scenarios[phase.name] = {
+            executor: 'constant-arrival-rate',
+            rate: phase.targetTPS,
+            timeUnit: '1s',
+            duration: phase.duration,
+            preAllocatedVUs,
+            maxVUs,
+            startTime: `${cumulativeStartSeconds}s`,
+            exec: 'runTest',
+        };
+        cumulativeStartSeconds += durationSeconds;
+    });
+    return scenarios;
+}
+
+// =============================================================================
+// 8. METRIC TAG HELPERS
+// =============================================================================
+//
+// IMPORTANT:
+//
+// These helpers create the exact phase + URL intersections used by reporting.
+//
+// NOTE: the custom tag is called "page" (not "url").
+// k6 already auto-tags every HTTP metric sample with a built-in system tag
+// named "url" (the literal request URL). A user-defined tag sharing that
+// name is silently dropped for http_reqs / http_req_duration / etc., so the
+// submetrics below would always read back empty if we called it "url".
+// "page" avoids the collision.
+//
+// Example:
+//
+// http_req_duration{
+//   scenario:phase_10000tps,
+//   page:homepage_gamma
+// }
+//
+// This is what allows:
+//
+// Phase 10,000 TPS
+//   -> Homepage response time
+//   -> FAQ response time
+//   -> ContactUs response time
+//
+// without storing individual requests.
+// =============================================================================
+
+function urlTag(name, url) {
+    return `${name}{page:${url}}`;
+}
+
+function phaseTag(name, phase) {
+    return `${name}{scenario:${phase}}`;
+}
+
+function phaseUrlTag(name, phase, url) {
+    return `${name}{scenario:${phase},page:${url}}`;
+}
+
+function phaseUrlClassTag(name, phase, url, cls) {
+    return `${name}{scenario:${phase},page:${url},class:${cls}}`;
+}
+
+function urlClassTag(name, url, cls) {
+    return `${name}{page:${url},class:${cls}}`;
+}
+
+function phaseClassTag(name, phase, cls) {
+    return `${name}{scenario:${phase},class:${cls}}`;
+}
+
+// =============================================================================
+// 9. THRESHOLDS
+// =============================================================================
+//
+// Thresholds are deliberately always-true.
+//
+// Their purpose here is to register the bounded tagged metric series so they
+// can be retrieved from handleSummary().
+//
+// Number of series:
+//
+//     phases x URLs x metrics
+//
+// NOT:
+//
+//     requests
+//
+// Therefore 10K TPS / millions of requests does not cause the metric
+// cardinality to grow with request volume.
+// =============================================================================
+
+function buildThresholds(config) {
+
+    const th = {};
+
+    const urls =
+        config.urls.map((u) => u.id);
+
+    const phases =
+        config.phases.map((p) => p.name);
+
+    // ---------------------------------------------------------------------------
+    // URL-level metrics
+    // ---------------------------------------------------------------------------
+
+    urls.forEach((url) => {
+
+        th[urlTag('http_reqs', url)] =
+            ['count>=0'];
+
+        th[urlTag('http_req_duration', url)] =
+            ['p(99)>=0'];
+
+        th[urlTag('http_req_failed', url)] =
+            ['rate>=0'];
+
+        th[urlTag('cache_hit_count', url)] =
+            ['count>=0'];
+
+        th[urlTag('cache_miss_count', url)] =
+            ['count>=0'];
+
+        th[urlTag('cache_unknown_count', url)] =
+            ['count>=0'];
+
+        th[urlTag('cache_not_observable_count', url)] =
+            ['count>=0'];
+
+        th[urlTag('cache_not_applicable_count', url)] =
+            ['count>=0'];
+
+        th[urlTag('cache_age', url)] =
+            ['avg>=0'];
+
+        th[urlTag('backend_response_count', url)] =
+            ['count>=0'];
+
+        th[urlTag('cache_response_count', url)] =
+            ['count>=0'];
+
+        STATUS_CLASSES.forEach((cls) => {
+
+            th[
+                urlClassTag(
+                    'status_class_count',
+                    url,
+                    cls
+                )
+            ] = ['count>=0'];
+        });
+    });
+
+    // ---------------------------------------------------------------------------
+    // Phase-level metrics
+    // ---------------------------------------------------------------------------
+
+    phases.forEach((phase) => {
+
+        th[
+            phaseTag(
+                'http_reqs',
+                phase
+            )
+        ] = ['count>=0'];
+
+        th[
+            phaseTag(
+                'http_req_duration',
+                phase
+            )
+        ] = ['p(99)>=0'];
+
+        th[
+            phaseTag(
+                'http_req_failed',
+                phase
+            )
+        ] = ['rate>=0'];
+
+        th[
+            phaseTag(
+                'iterations',
+                phase
+            )
+        ] = ['count>=0'];
+
+        th[
+            phaseTag(
+                'dropped_iterations',
+                phase
+            )
+        ] = ['count>=0'];
+
+        // -------------------------------------------------------------------------
+        // Native network-timing metrics (phase-scoped only, not phase+page).
+        //
+        // These are metrics k6 already emits for every request -- reusing them
+        // here just registers the bounded per-phase submetric series.
+        // -------------------------------------------------------------------------
+
+        NETWORK_TREND_METRICS.forEach((m) => {
+
+            th[
+                phaseTag(
+                    m.key,
+                    phase
+                )
+            ] = ['p(99)>=0'];
+        });
+
+        th[
+            phaseTag(
+                'data_sent',
+                phase
+            )
+        ] = ['count>=0'];
+
+        th[
+            phaseTag(
+                'data_received',
+                phase
+            )
+        ] = ['count>=0'];
+
+        th[
+            phaseTag(
+                'iteration_duration',
+                phase
+            )
+        ] = ['p(99)>=0'];
+
+        STATUS_CLASSES.forEach((cls) => {
+
+            th[
+                phaseClassTag(
+                    'status_class_count',
+                    phase,
+                    cls
+                )
+            ] = ['count>=0'];
+        });
+
+        // -------------------------------------------------------------------------
+        // PHASE + URL metrics
+        //
+        // This is the important new section.
+        // -------------------------------------------------------------------------
+
+        urls.forEach((url) => {
+
+            th[
+                phaseUrlTag(
+                    'http_reqs',
+                    phase,
+                    url
+                )
+            ] = ['count>=0'];
+
+            th[
+                phaseUrlTag(
+                    'http_req_duration',
+                    phase,
+                    url
+                )
+            ] = ['p(99)>=0'];
+
+            th[
+                phaseUrlTag(
+                    'http_req_failed',
+                    phase,
+                    url
+                )
+            ] = ['rate>=0'];
+
+            STATUS_CLASSES.forEach((cls) => {
+
+                th[
+                    phaseUrlClassTag(
+                        'status_class_count',
+                        phase,
+                        url,
+                        cls
+                    )
+                ] = ['count>=0'];
+            });
+        });
+    });
+
+    return th;
+}
+
+// =============================================================================
+// 10. K6 OPTIONS
+// =============================================================================
+
+export const options = {
+
+    scenarios:
+        buildScenarios(CONFIG),
+
+    thresholds:
+        buildThresholds(CONFIG),
+
+    summaryTrendStats: [
+        'avg',
+        'min',
+        'med',
+        'max',
+        'p(90)',
+        'p(95)',
+        'p(99)',
+    ],
+
+    discardResponseBodies: true,
+};
+
+// =============================================================================
+// 11. TEST FUNCTION
+// =============================================================================
+//
+// Keep this section extremely small.
+//
+// This function executes once for every arrival.
+//
+// There is deliberately:
+//
+// - no logging
+// - no report array
+// - no response body parsing
+// - no JSON parsing
+// - no HTML parsing
+// =============================================================================
+
+export function runTest() {
+
+    const urlConf = pickUrl();
+
+    const id = urlConf.id;
+
+    const res = http.request(
+        urlConf.method || 'GET',
+        urlConf.url,
+        urlConf.body || null,
+        {
+            tags: {
+                page: id,
+            },
+
+            responseType: 'none',
+        }
+    );
+
+    // Status classification.
+    statusClassCount.add(
+        1,
+        {
+            page: id,
+            class: statusClass(res.status),
+        }
+    );
+
+    // Cache/backend classification.
+    recordCache(
+        res,
+        urlConf
+    );
+}
+
+// =============================================================================
+// 12. CASE-INSENSITIVE RESPONSE HEADER LOOKUP
+// =============================================================================
+
+function getHeaderCI(headers, name) {
+
+    if (!headers || !name) {
+        return undefined;
+    }
+
+    const lower =
+        name.toLowerCase();
+
+    for (const key in headers) {
+
+        if (key.toLowerCase() === lower) {
+
+            return headers[key];
+        }
+    }
+
+    return undefined;
+}
+
+// =============================================================================
+// 13. CACHE / BACKEND RECORDING
+// =============================================================================
+
+function recordCache(res, urlConf) {
+
+    const id = urlConf.id;
+
+    const strategy =
+        CACHE_STRATEGY[urlConf.provider] ||
+        'header';
+
+    // ---------------------------------------------------------------------------
+    // No cache layer
+    // ---------------------------------------------------------------------------
+
+    if (strategy === 'not-applicable') {
+
+        cacheNotApplicableCount.add(
+            1,
+            {
+                page: id,
+            }
+        );
+
+        return;
+    }
+
+    // ---------------------------------------------------------------------------
+    // GCP CDN / GCLB
+    //
+    // Cache result is not inferred from client headers.
+    // ---------------------------------------------------------------------------
+
+    if (strategy === 'not-observable') {
+
+        cacheNotObservableCount.add(
+            1,
+            {
+                page: id,
+            }
+        );
+
+        return;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Header-based CDN classification
+    // ---------------------------------------------------------------------------
+
+    const cfg =
+        CONFIG.cacheHeaders;
+
+    const headers =
+        res.headers;
+
+    let classified = false;
+
+    for (
+        const headerName
+        of cfg.statusHeaders
+    ) {
+
+        const value =
+            getHeaderCI(
+                headers,
+                headerName
+            );
+
+        if (value === undefined) {
+            continue;
+        }
+
+        const v = String(value).toLowerCase();
+
+        if (v.includes('hit')) {
+            cacheHitCount.add(1, { page: id });
+            classified = true;
+            break;
+        }
+
+        if (v.includes('miss')) {
+            cacheMissCount.add(1, { page: id });
+            classified = true;
+            break;
+        }
+    }
+
+    if (!classified) cacheUnknownCount.add(1, { page: id });
+
+    // ---------------------------------------------------------------------------
+    // Age
+    // ---------------------------------------------------------------------------
+
+    const ageValue = getHeaderCI(headers, cfg.ageHeader);
+
+    if (ageValue !== undefined) {
+        const ageNum = parseFloat(ageValue);
+        if (!isNaN(ageNum)) cacheAge.add(ageNum, { page: id });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Backend response indicator
+    // ---------------------------------------------------------------------------
+
+    const backendValue = getHeaderCI(headers, cfg.backendHeader);
+
+    if (backendValue !== undefined && String(backendValue).toLowerCase() === 'true') {
+        backendResponseCount.add(1, { page: id });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cache response indicator
+    // ---------------------------------------------------------------------------
+
+    const cacheRespValue = getHeaderCI(headers, cfg.cacheResponseHeader);
+
+    if (cacheRespValue !== undefined && String(cacheRespValue).toLowerCase() === 'true') {
+        cacheResponseCount.add(1, { page: id });
+    }
+}
+
+// =============================================================================
+// 14. REPORTING HELPERS
+// =============================================================================
+
+function metric(data, name) {
+
+    return (
+        data.metrics &&
+        data.metrics[name]
+    ) || null;
+}
+
+function trendStat(m, stat, fallback = 0) {
+    return (m && m.values && m.values[stat] !== undefined) ? m.values[stat] : fallback;
+}
+
+function counterCount(m, fallback = 0) {
+    return (m && m.values && m.values.count !== undefined) ? m.values.count : fallback;
+}
+
+function rateValue(m, fallback = 0) {
+    return (m && m.values && m.values.rate !== undefined) ? m.values.rate : fallback;
+}
+
+function gaugeMax(m, fallback = 0) {
+    return (m && m.values && m.values.max !== undefined) ? m.values.max : fallback;
+}
+
+function pct(part, whole) {
+    return whole > 0 ? (part / whole) * 100 : 0;
+}
+
+function fmt(n, decimals = 2) {
+    if (n === null || n === undefined || isNaN(n)) return 'n/a';
+    return Number(n).toFixed(decimals);
+}
+
+function esc(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function fmtBytes(n) {
+    if (n === null || n === undefined || isNaN(n)) return 'n/a';
+    const num = Number(n);
+    if (num < 1024) return `${num.toFixed(0)} B`;
+    if (num < 1024 * 1024) return `${(num / 1024).toFixed(2)} KB`;
+    return `${(num / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// =============================================================================
+// 15. BUILD PAGE METRICS FOR A SPECIFIC PHASE
+// =============================================================================
+//
+// THIS is the main reporting change.
+//
+// Every page is now explicitly scoped to:
+//
+//     scenario = phase
+//     url      = page
+//
+// Therefore:
+//
+// Phase 1000 TPS
+//   Homepage response metrics
+//   FAQ response metrics
+//   ContactUs response metrics
+//
+// Phase 5000 TPS
+//   Homepage response metrics
+//   FAQ response metrics
+//   ContactUs response metrics
+//
+// etc.
+// =============================================================================
+
+function buildPhasePageRow(
+    data,
+    phase,
+    urlConf
+) {
+
+    const phaseName =
+        phase.name;
+
+    const id =
+        urlConf.id;
+
+    // ---------------------------------------------------------------------------
+    // Phase + URL request count
+    // ---------------------------------------------------------------------------
+
+    const reqs =
+        counterCount(
+            metric(
+                data,
+                phaseUrlTag(
+                    'http_reqs',
+                    phaseName,
+                    id
+                )
+            )
+        );
+
+    // ---------------------------------------------------------------------------
+    // Phase + URL response time
+    // ---------------------------------------------------------------------------
+
+    const durationM =
+        metric(
+            data,
+            phaseUrlTag(
+                'http_req_duration',
+                phaseName,
+                id
+            )
+        );
+
+    // ---------------------------------------------------------------------------
+    // Phase + URL status classes
+    // ---------------------------------------------------------------------------
+
+    const classCounts = {};
+
+    STATUS_CLASSES.forEach((cls) => {
+
+        classCounts[cls] =
+            counterCount(
+                metric(
+                    data,
+                    phaseUrlClassTag(
+                        'status_class_count',
+                        phaseName,
+                        id,
+                        cls
+                    )
+                )
+            );
+    });
+
+    const failed =
+        classCounts['4xx'] +
+        classCounts['5xx'] +
+        classCounts['err'];
+
+    const passed =
+        Math.max(
+            0,
+            reqs - failed
+        );
+
+    const errorPct =
+        pct(
+            failed,
+            reqs
+        );
+
+    return {
+
+        id,
+
+        name:
+            urlConf.name || id,
+
+        url:
+            urlConf.url,
+
+        count:
+            reqs,
+
+        avg:
+            trendStat(
+                durationM,
+                'avg'
+            ),
+
+        min:
+            trendStat(
+                durationM,
+                'min'
+            ),
+
+        p90:
+            trendStat(
+                durationM,
+                'p(90)'
+            ),
+
+        p95:
+            trendStat(
+                durationM,
+                'p(95)'
+            ),
+
+        p99:
+            trendStat(
+                durationM,
+                'p(99)'
+            ),
+
+        max:
+            trendStat(
+                durationM,
+                'max'
+            ),
+
+        passed,
+
+        failed,
+
+        errorPct,
+
+        classCounts,
+
+        status:
+            errorPct <=
+                CONFIG.reporting.maxErrorRatePct
+                ? 'PASS'
+                : 'FAIL',
+    };
+}
+
+// =============================================================================
+// 16. BUILD PHASE ROW
+// =============================================================================
+//
+// Each phase contains its own pages[] collection.
+//
+// This gives the report hierarchy:
+//
+// phase
+//   -> TPS
+//   -> phase status
+//   -> pages
+//        -> Homepage
+//        -> FAQ
+//        -> ContactUs
+// =============================================================================
+
+function buildPhaseRow(
+    data,
+    phase
+) {
+
+    const name =
+        phase.name;
+
+    // ---------------------------------------------------------------------------
+    // Phase request count
+    // ---------------------------------------------------------------------------
+
+    const reqs =
+        counterCount(
+            metric(
+                data,
+                phaseTag(
+                    'http_reqs',
+                    name
+                )
+            )
+        );
+
+    // ---------------------------------------------------------------------------
+    // Phase response time
+    //
+    // Kept for overall phase-level context.
+    // Page-level values are shown below it.
+    // ---------------------------------------------------------------------------
+
+    const durationM =
+        metric(
+            data,
+            phaseTag(
+                'http_req_duration',
+                name
+            )
+        );
+
+    // ---------------------------------------------------------------------------
+    // Phase status classes
+    // ---------------------------------------------------------------------------
+
+    const classCounts = {};
+
+    STATUS_CLASSES.forEach((cls) => {
+
+        classCounts[cls] =
+            counterCount(
+                metric(
+                    data,
+                    phaseClassTag(
+                        'status_class_count',
+                        name,
+                        cls
+                    )
+                )
+            );
+    });
+
+    const failed =
+        classCounts['4xx'] +
+        classCounts['5xx'] +
+        classCounts['err'];
+
+    const passed =
+        Math.max(
+            0,
+            reqs - failed
+        );
+
+    const errorPct =
+        pct(
+            failed,
+            reqs
+        );
+
+    // ---------------------------------------------------------------------------
+    // Phase duration / actual TPS
+    // ---------------------------------------------------------------------------
+
+    const durationSeconds =
+        parseDurationToSeconds(
+            phase.duration
+        );
+
+    const actualTps =
+        durationSeconds > 0
+            ? reqs / durationSeconds
+            : 0;
+
+    // ---------------------------------------------------------------------------
+    // Dropped iterations
+    // ---------------------------------------------------------------------------
+
+    const dropped =
+        counterCount(
+            metric(
+                data,
+                phaseTag(
+                    'dropped_iterations',
+                    name
+                )
+            )
+        );
+
+    // ---------------------------------------------------------------------------
+    // TPS achievement
+    // ---------------------------------------------------------------------------
+
+    const tpsAchievementPct =
+        pct(
+            actualTps,
+            phase.targetTPS
+        );
+
+    const tpsOk =
+        tpsAchievementPct >=
+        CONFIG.reporting.minTpsAchievementPct;
+
+    const errOk =
+        errorPct <=
+        CONFIG.reporting.maxErrorRatePct;
+
+    const dropOk =
+        dropped === 0;
+
+    // ---------------------------------------------------------------------------
+    // PAGE METRICS INSIDE THIS PHASE
+    // ---------------------------------------------------------------------------
+
+    const pages =
+        CONFIG.urls.map(
+            (urlConf) =>
+                buildPhasePageRow(
+                    data,
+                    phase,
+                    urlConf
+                )
+        );
+
+    const networkMetrics = buildPhaseNetworkMetrics(data, name);
+
+    return {
+        phase: name,
+        targetTps: phase.targetTPS,
+        actualTps,
+        tpsAchievementPct,
+        duration: phase.duration,
+        avg: trendStat(durationM, 'avg'),
+        min: trendStat(durationM, 'min'),
+        p90: trendStat(durationM, 'p(90)'),
+        p95: trendStat(durationM, 'p(95)'),
+        p99: trendStat(durationM, 'p(99)'),
+        max: trendStat(durationM, 'max'),
+        count: reqs,
+        passed,
+        failed,
+        errorPct,
+        classCounts,
+        dropped,
+        tpsOk,
+        errOk,
+        dropOk,
+        status: tpsOk && errOk && dropOk ? 'PASS' : 'FAIL',
+        pages,
+        networkMetrics,
+    };
+}
+
+// =============================================================================
+// 16b. NATIVE NETWORK METRICS FOR A PHASE
+// =============================================================================
+//
+// Pulls back out the native k6 metrics that were already registered as
+// phase-scoped submetrics in buildThresholds(). No new metric objects are
+// created here -- this only reads data k6 was already collecting.
+// =============================================================================
+
+function buildPhaseNetworkMetrics(
+    data,
+    phaseName
+) {
+
+    const trends =
+        NETWORK_TREND_METRICS.map((m) => {
+
+            const met =
+                metric(
+                    data,
+                    phaseTag(
+                        m.key,
+                        phaseName
+                    )
+                );
+
+            return {
+
+                key:
+                    m.key,
+
+                label:
+                    m.label,
+
+                avg:
+                    trendStat(met, 'avg'),
+
+                min:
+                    trendStat(met, 'min'),
+
+                p90:
+                    trendStat(met, 'p(90)'),
+
+                p95:
+                    trendStat(met, 'p(95)'),
+
+                p99:
+                    trendStat(met, 'p(99)'),
+
+                max:
+                    trendStat(met, 'max'),
+            };
+        });
+
+    const dataSentBytes =
+        counterCount(
+            metric(
+                data,
+                phaseTag('data_sent', phaseName)
+            )
+        );
+
+    const dataReceivedBytes =
+        counterCount(
+            metric(
+                data,
+                phaseTag('data_received', phaseName)
+            )
+        );
+
+    const iterDurM =
+        metric(
+            data,
+            phaseTag('iteration_duration', phaseName)
+        );
+
+    const iterationDuration = {
+
+        avg:
+            trendStat(iterDurM, 'avg'),
+
+        min:
+            trendStat(iterDurM, 'min'),
+
+        p90:
+            trendStat(iterDurM, 'p(90)'),
+
+        p95:
+            trendStat(iterDurM, 'p(95)'),
+
+        p99:
+            trendStat(iterDurM, 'p(99)'),
+
+        max:
+            trendStat(iterDurM, 'max'),
+    };
+
+    const httpReqFailedM =
+        metric(
+            data,
+            phaseTag('http_req_failed', phaseName)
+        );
+
+    const httpReqFailedPct =
+        rateValue(httpReqFailedM) * 100;
+
+    return {
+
+        trends,
+
+        dataSentBytes,
+
+        dataReceivedBytes,
+
+        iterationDuration,
+
+        httpReqFailedPct,
+    };
+}
+
+// =============================================================================
+// 17. CACHE REPORT
+// =============================================================================
+
+function buildCacheRow(data, urlConf) {
+    const id = urlConf.id;
+    const strategy = CACHE_STRATEGY[urlConf.provider] || 'header';
+
+    if (strategy === 'not-applicable') {
+        return { id, name: urlConf.name || id, url: urlConf.url, strategy, note: 'No CDN in front of this URL -- not applicable.' };
+    }
+
+    if (strategy === 'not-observable') {
+        return { id, name: urlConf.name || id, url: urlConf.url, strategy, note: 'GCP Cloud CDN does not expose cache status to the client. Check cache_result in Cloud Monitoring / Cloud Logging for the test time window.' };
+    }
+
+    const hit = counterCount(metric(data, urlTag('cache_hit_count', id)));
+    const miss = counterCount(metric(data, urlTag('cache_miss_count', id)));
+    const unknown = counterCount(metric(data, urlTag('cache_unknown_count', id)));
+    const backend = counterCount(metric(data, urlTag('backend_response_count', id)));
+    const cacheResp = counterCount(metric(data, urlTag('cache_response_count', id)));
+    const avgAge = trendStat(metric(data, urlTag('cache_age', id)), 'avg');
+    const classifiable = hit + miss;
+
+    return { id, name: urlConf.name || id, url: urlConf.url, strategy, hit, miss, unknown, hitPct: pct(hit, classifiable), backend, cacheResp, avgAge };
+}
+
+// =============================================================================
+// 18. HTML REPORT
+// =============================================================================
+
+function buildHtmlReport(summary) {
+    const statusBadge = (status) => `<span class="badge ${status === 'PASS' ? 'pass' : 'fail'}">${esc(status)}</span>`;
+
+    const phaseSections = summary.phases.map((phase, phaseIndex) => {
+        const pageRows = phase.pages.map((page) => `<tr><td class="page-name">${esc(page.name)}<div class="page-url">${esc(page.url)}</div></td><td>${page.count}</td><td>${fmt(page.avg)}</td><td>${fmt(page.p90)}</td><td>${fmt(page.p95)}</td><td>${fmt(page.p99)}</td><td>${fmt(page.max)}</td><td>${page.passed}</td><td>${page.failed}</td><td>${fmt(page.errorPct)}%</td><td>${page.classCounts['2xx']}</td><td>${page.classCounts['3xx']}</td><td>${page.classCounts['4xx']}</td><td>${page.classCounts['5xx']}</td><td>${statusBadge(page.status)}</td></tr>`).join('');
+
+        const networkTrendRows = phase.networkMetrics.trends.map((t) => `<tr><td class="page-name">${esc(t.label)}</td><td>${fmt(t.avg)}</td><td>${fmt(t.min)}</td><td>${fmt(t.p90)}</td><td>${fmt(t.p95)}</td><td>${fmt(t.p99)}</td><td>${fmt(t.max)}</td></tr>`).join('');
+
+        const iterD =
+            phase.networkMetrics.iterationDuration;
+
+        const networkSection = `
+          <details class="network-metrics">
+
+            <summary>
+              Network / Native k6 Metrics
+            </summary>
+
+            <div class="network-body">
+
+              <div class="phase-summary-grid">
+
+                <div class="mini-stat">
+                  <div class="label">Data Sent</div>
+                  <div class="value">${fmtBytes(phase.networkMetrics.dataSentBytes)}</div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">Data Received</div>
+                  <div class="value">${fmtBytes(phase.networkMetrics.dataReceivedBytes)}</div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">HTTP Req Failed</div>
+                  <div class="value">${fmt(phase.networkMetrics.httpReqFailedPct)}%</div>
+                </div>
+
+              </div>
+
+              <div class="table-wrapper">
+
+                <table class="page-table">
+
+                  <thead>
+                    <tr>
+                      <th>Metric (ms)</th>
+                      <th>Avg</th>
+                      <th>Min</th>
+                      <th>P90</th>
+                      <th>P95</th>
+                      <th>P99</th>
+                      <th>Max</th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    ${networkTrendRows}
+                    <tr>
+                      <td class="page-name">iteration_duration</td>
+                      <td>${fmt(iterD.avg)}</td>
+                      <td>${fmt(iterD.min)}</td>
+                      <td>${fmt(iterD.p90)}</td>
+                      <td>${fmt(iterD.p95)}</td>
+                      <td>${fmt(iterD.p99)}</td>
+                      <td>${fmt(iterD.max)}</td>
+                    </tr>
+                  </tbody>
+
+                </table>
+
+              </div>
+
+              <p class="code-note">
+                These are k6's own native per-request timing metrics
+                (http_req_blocked/connecting/tls_handshaking/sending/waiting/receiving),
+                plus data_sent, data_received, and iteration_duration --
+                scoped to this phase. No additional custom metrics were
+                created to produce this table.
+              </p>
+
+            </div>
+
+          </details>
+        `;
+
+        return `
+          <details class="phase" ${phaseIndex === 0 ? 'open' : ''}>
+
+            <summary>
+
+              <div class="phase-title">
+
+                <span class="phase-name">
+                  ${esc(phase.phase)}
+                </span>
+
+                <span class="phase-tps">
+                  Target:
+                  <b>${phase.targetTps} TPS</b>
+                </span>
+
+                <span class="phase-tps">
+                  Actual:
+                  <b>${fmt(phase.actualTps, 1)} TPS</b>
+                </span>
+
+                <span class="phase-requests">
+                  Requests:
+                  <b>${phase.count}</b>
+                </span>
+
+                <span>
+                  ${statusBadge(phase.status)}
+                </span>
+
+              </div>
+
+            </summary>
+
+            <div class="phase-body">
+
+              <div class="phase-summary-grid">
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Target TPS
+                  </div>
+                  <div class="value">
+                    ${phase.targetTps}
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Actual TPS
+                  </div>
+                  <div class="value">
+                    ${fmt(phase.actualTps, 1)}
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    TPS Achievement
+                  </div>
+                  <div class="value">
+                    ${fmt(phase.tpsAchievementPct)}%
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Requests
+                  </div>
+                  <div class="value">
+                    ${phase.count}
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Dropped
+                  </div>
+                  <div class="value">
+                    ${phase.dropped}
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Error %
+                  </div>
+                  <div class="value">
+                    ${fmt(phase.errorPct)}%
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Duration
+                  </div>
+                  <div class="value">
+                    ${esc(phase.duration)}
+                  </div>
+                </div>
+
+                <div class="mini-stat">
+                  <div class="label">
+                    Phase Status
+                  </div>
+                  <div class="value">
+                    ${statusBadge(phase.status)}
+                  </div>
+                </div>
+
+              </div>
+
+              <h3>
+                Page Performance
+              </h3>
+
+              <div class="table-wrapper">
+
+                <table class="page-table">
+
+                  <thead>
+
+                    <tr>
+
+                      <th>Page</th>
+
+                      <th>Requests</th>
+
+                      <th>Avg (ms)</th>
+
+                      <th>P90 (ms)</th>
+
+                      <th>P95 (ms)</th>
+
+                      <th>P99 (ms)</th>
+
+                      <th>Max (ms)</th>
+
+                      <th>Passed</th>
+
+                      <th>Failed</th>
+
+                      <th>Error %</th>
+
+                      <th>2xx</th>
+
+                      <th>3xx</th>
+
+                      <th>4xx</th>
+
+                      <th>5xx</th>
+
+                      <th>Status</th>
+
+                    </tr>
+
+                  </thead>
+
+                  <tbody>
+                    ${pageRows}
+                  </tbody>
+
+                </table>
+
+              </div>
+
+              ${networkSection}
+
+            </div>
+
+          </details>
+        `;
+    })
+        .join('');
+
+    // ===========================================================================
+    // CACHE TABLE
+    // ===========================================================================
+
+    const cacheRows =
+        summary.cache
+            .map((c) => {
+
+                if (
+                    c.strategy === 'not-applicable' ||
+                    c.strategy === 'not-observable'
+                ) {
+
+                    return `
+            <tr>
+
+              <td>
+                ${esc(c.name)}
+              </td>
+
+              <td colspan="7"
+                  class="muted-note">
+
+                ${esc(c.note)}
+
+              </td>
+
+            </tr>
+          `;
+                }
+
+                return `
+          <tr>
+
+            <td>
+              ${esc(c.name)}
+            </td>
+
+            <td>${c.hit}</td>
+
+            <td>${c.miss}</td>
+
+            <td>${fmt(c.hitPct)}%</td>
+
+            <td>${c.unknown}</td>
+
+            <td>${c.backend}</td>
+
+            <td>${c.cacheResp}</td>
+
+            <td>${fmt(c.avgAge)}</td>
+
+          </tr>
+        `;
+            })
+            .join('');
+
+    // ===========================================================================
+    // OVERALL HTTP STATUS
+    // ===========================================================================
+
+    const httpClassRows =
+        Object.entries(
+            summary.overall.classCounts
+        )
+            .map(([cls, count]) => {
+
+                return `
+          <tr>
+
+            <td>
+              ${esc(cls)}
+            </td>
+
+            <td>
+              ${count}
+            </td>
+
+            <td>
+              ${fmt(
+                    pct(
+                        count,
+                        summary.overall.count
+                    )
+                )}%
+            </td>
+
+          </tr>
+        `;
+            })
+            .join('');
+
+    const overallGood =
+        summary.overall.status === 'PASS';
+
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>k6 Performance Test Report</title><style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    Arial,
+    sans-serif;
+
+  margin: 0;
+
+  padding: 24px;
+
+  color: #1a1a1a;
+
+  background: #f7f8fa;
+
+}
+
+.container {
+
+  max-width: 1800px;
+
+  margin: 0 auto;
+
+}
+
+h1 {
+
+  font-size: 24px;
+
+  margin: 0 0 6px 0;
+
+}
+
+h2 {
+
+  font-size: 17px;
+
+  margin-top: 30px;
+
+  margin-bottom: 10px;
+
+  border-bottom:
+    2px solid #e2e4e8;
+
+  padding-bottom: 7px;
+
+}
+
+h3 {
+
+  font-size: 15px;
+
+  margin:
+    22px 0 8px 0;
+
+}
+
+.subtitle {
+
+  color: #666;
+
+  margin-bottom: 20px;
+
+  font-size: 13px;
+
+}
+
+.alert {
+
+  padding: 12px 16px;
+
+  border-radius: 8px;
+
+  margin:
+    14px 0 20px 0;
+
+  font-size: 13px;
+
+}
+
+.alert.ok {
+
+  background: #d7f5df;
+
+  color: #1a7d3a;
+
+}
+
+.alert.bad {
+
+  background: #fbdada;
+
+  color: #ab1c1c;
+
+}
+
+.summary-grid {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(
+      auto-fit,
+      minmax(170px, 1fr)
+    );
+
+  gap: 10px;
+
+}
+
+.stat-card {
+
+  background: #fff;
+
+  border:
+    1px solid #e2e4e8;
+
+  border-radius: 8px;
+
+  padding: 12px 14px;
+
+}
+
+.stat-card .label {
+
+  color: #666;
+
+  font-size: 11px;
+
+}
+
+.stat-card .value {
+
+  font-size: 20px;
+
+  font-weight: 700;
+
+  margin-top: 3px;
+
+}
+
+.badge {
+
+  display: inline-block;
+
+  padding:
+    3px 9px;
+
+  border-radius: 10px;
+
+  font-weight: 600;
+
+  font-size: 11px;
+
+}
+
+.badge.pass {
+
+  background: #d7f5df;
+
+  color: #1a7d3a;
+
+}
+
+.badge.fail {
+
+  background: #fbdada;
+
+  color: #ab1c1c;
+
+}
+
+/* -------------------------------------------------------------------------- */
+/* PHASE ACCORDION */
+/* -------------------------------------------------------------------------- */
+
+.phase {
+
+  background: #fff;
+
+  border:
+    1px solid #dfe2e6;
+
+  border-radius: 8px;
+
+  margin-bottom: 10px;
+
+  overflow: hidden;
+
+}
+
+.phase summary {
+
+  cursor: pointer;
+
+  list-style: none;
+
+  padding: 13px 16px;
+
+  background: #fff;
+
+}
+
+.phase summary::-webkit-details-marker {
+
+  display: none;
+
+}
+
+.phase summary::before {
+
+  content: "▶";
+
+  display: inline-block;
+
+  font-size: 10px;
+
+  margin-right: 9px;
+
+  color: #666;
+
+  transition:
+    transform 0.15s ease;
+
+}
+
+.phase[open]
+summary::before {
+
+  transform:
+    rotate(90deg);
+
+}
+
+.phase-title {
+
+  display: inline-flex;
+
+  align-items: center;
+
+  gap: 18px;
+
+  flex-wrap: wrap;
+
+}
+
+.phase-name {
+
+  font-weight: 700;
+
+  font-size: 14px;
+
+}
+
+.phase-tps {
+
+  color: #555;
+
+  font-size: 12px;
+
+}
+
+.phase-requests {
+
+  color: #555;
+
+  font-size: 12px;
+
+}
+
+.phase-body {
+
+  border-top:
+    1px solid #e5e7eb;
+
+  padding: 14px 16px 18px;
+
+  background: #fafbfc;
+
+}
+
+.phase-summary-grid {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(
+      auto-fit,
+      minmax(130px, 1fr)
+    );
+
+  gap: 8px;
+
+}
+
+.mini-stat {
+
+  background: #fff;
+
+  border:
+    1px solid #e3e5e8;
+
+  border-radius: 6px;
+
+  padding: 9px 11px;
+
+}
+
+.mini-stat .label {
+
+  color: #777;
+
+  font-size: 10px;
+
+}
+
+.mini-stat .value {
+
+  font-weight: 700;
+
+  font-size: 15px;
+
+  margin-top: 2px;
+
+}
+
+/* -------------------------------------------------------------------------- */
+/* TABLES */
+/* -------------------------------------------------------------------------- */
+
+.table-wrapper {
+
+  overflow-x: auto;
+
+}
+
+table {
+
+  border-collapse: collapse;
+
+  width: 100%;
+
+  min-width: 1100px;
+
+  background: #fff;
+
+  font-size: 12px;
+
+}
+
+th,
+td {
+
+  border:
+    1px solid #e2e4e8;
+
+  padding:
+    7px 9px;
+
+  text-align: right;
+
+  white-space: nowrap;
+
+}
+
+th {
+
+  background: #f0f1f4;
+
+  font-weight: 600;
+
+}
+
+th:first-child,
+td:first-child {
+
+  text-align: left;
+
+}
+
+.page-name {
+
+  font-weight: 600;
+
+}
+
+.page-url {
+
+  color: #888;
+
+  font-size: 10px;
+
+  margin-top: 2px;
+
+  font-weight: normal;
+
+}
+
+.muted-note {
+
+  text-align: left;
+
+  color: #888;
+
+  font-style: italic;
+
+}
+
+.code-note {
+
+  font-size: 12px;
+
+  color: #666;
+
+}
+
+/* -------------------------------------------------------------------------- */
+/* NETWORK METRICS ACCORDION (nested inside a phase) */
+/* -------------------------------------------------------------------------- */
+
+.network-metrics {
+
+  background: #fff;
+
+  border:
+    1px solid #e3e5e8;
+
+  border-radius: 8px;
+
+  margin-top: 14px;
+
+  overflow: hidden;
+
+}
+
+.network-metrics summary {
+
+  cursor: pointer;
+
+  list-style: none;
+
+  padding: 10px 14px;
+
+  background: #f7f8fa;
+
+  font-weight: 600;
+
+  font-size: 13px;
+
+  color: #333;
+
+}
+
+.network-metrics summary::-webkit-details-marker {
+
+  display: none;
+
+}
+
+.network-metrics summary::before {
+
+  content: "▶";
+
+  display: inline-block;
+
+  font-size: 9px;
+
+  margin-right: 8px;
+
+  color: #666;
+
+  transition:
+    transform 0.15s ease;
+
+}
+
+.network-metrics[open]
+summary::before {
+
+  transform:
+    rotate(90deg);
+
+}
+
+.network-body {
+
+  border-top:
+    1px solid #e5e7eb;
+
+  padding: 12px 14px 14px;
+
+}
+
+</style></head><body><div class="container"><h1>k6 Performance Test Report</h1><div class="subtitle">
+
+  Test type:
+  <b>${esc(summary.meta.testType)}</b>
+
+  &middot;
+
+  ${esc(summary.meta.startTime)}
+
+  &rarr;
+
+  ${esc(summary.meta.endTime)}
+
+  &middot;
+
+  Duration:
+  <b>
+    ${fmt(summary.meta.durationSec, 0)}s
+  </b>
+
+</div>
+
+<!-- ====================================================================== -->
+<!-- OVERALL STATUS -->
+<!-- ====================================================================== -->
+
+<div class="alert ${overallGood ? 'ok' : 'bad'}">
+
+  ${overallGood
+
+            ? `Overall test completed successfully.
+         Actual overall throughput was
+         ${fmt(summary.overall.actualTps, 1)} TPS.
+         Dropped iterations:
+         ${summary.overall.dropped}.`
+
+            : `WARNING: One or more overall load/error conditions did not meet
+         the configured acceptance criteria.
+         Actual throughput:
+         ${fmt(summary.overall.actualTps, 1)} TPS.
+         Dropped iterations:
+         ${summary.overall.dropped}.`
+        }
+
+</div>
+
+<!-- ====================================================================== -->
+<!-- 1. OVERALL SUMMARY -->
+<!-- ====================================================================== -->
+
+<h2>
+  1. Overall Summary
+</h2>
+
+<div class="summary-grid">
+
+  <div class="stat-card">
+
+    <div class="label">
+      Total Requests
+    </div>
+
+    <div class="value">
+      ${summary.overall.count}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Passed
+    </div>
+
+    <div class="value">
+      ${summary.overall.passed}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Failed
+    </div>
+
+    <div class="value">
+      ${summary.overall.failed}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Error Rate
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.errorPct)}%
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Peak Target TPS
+    </div>
+
+    <div class="value">
+      ${summary.overall.targetTps}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Overall Actual TPS
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.actualTps, 1)}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Dropped Iterations
+    </div>
+
+    <div class="value">
+      ${summary.overall.dropped}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Avg Latency
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.avg)} ms
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      P90
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.p90)} ms
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      P95
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.p95)} ms
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      P99
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.p99)} ms
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Max Latency
+    </div>
+
+    <div class="value">
+      ${fmt(summary.overall.max)} ms
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Max VUs
+    </div>
+
+    <div class="value">
+      ${summary.overall.vusMax}
+    </div>
+
+  </div>
+
+  <div class="stat-card">
+
+    <div class="label">
+      Overall Status
+    </div>
+
+    <div class="value">
+      ${statusBadge(summary.overall.status)}
+    </div>
+
+  </div>
+
+</div>
+
+<!-- ====================================================================== -->
+<!-- 2. PHASE-WISE BREAKDOWN -->
+<!-- ====================================================================== -->
+
+<h2>
+  2. Phase-wise Breakdown
+</h2>
+
+<p class="code-note">
+
+  Each phase contains the load-generator TPS metrics followed by
+  response-time and HTTP-status metrics for each configured page.
+
+  Expand a phase to view its page-level performance.
+
+</p>
+
+${phaseSections}
+
+<!-- ====================================================================== -->
+<!-- 3. CACHE -->
+<!-- ====================================================================== -->
+
+<h2>
+  3. Cache / Backend Breakdown
+</h2>
+
+<div class="table-wrapper">
+
+<table>
+
+<thead>
+
+<tr>
+
+  <th>Page</th>
+
+  <th>Cache Hit</th>
+
+  <th>Cache Miss</th>
+
+  <th>Hit %</th>
+
+  <th>Unknown</th>
+
+  <th>Backend</th>
+
+  <th>Cache Response</th>
+
+  <th>Avg Age (s)</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+${cacheRows}
+
+</tbody>
+
+</table>
+
+</div>
+
+<!-- ====================================================================== -->
+<!-- 4. HTTP STATUS -->
+<!-- ====================================================================== -->
+
+<h2>
+  4. Overall HTTP Status Details
+</h2>
+
+<div class="table-wrapper">
+
+<table>
+
+<thead>
+
+<tr>
+
+  <th>HTTP Class</th>
+
+  <th>Count</th>
+
+  <th>% Distribution</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+${httpClassRows}
+
+</tbody>
+
+</table>
+
+</div>
+
+<!-- ====================================================================== -->
+<!-- 5. NATIVE METRICS -->
+<!-- ====================================================================== -->
+
+<h2>
+  5. Native k6 Metrics
+</h2>
+
+<p class="code-note">
+
+  Per-phase network/timing breakdowns (http_req_blocked, connecting,
+  tls_handshaking, sending, waiting, receiving, data_sent, data_received,
+  iteration_duration) are available under "Network / Native k6 Metrics"
+  inside each phase above.
+
+  Full aggregate native k6 metrics are also retained in
+  <code>k6-summary.json</code>.
+
+  No per-request records are stored.
+
+  Metric cardinality is bounded by the configured phases and pages.
+
+</p>
+
+</div>
+
+</body>
+
+</html>
+`;
+}
+
+// =============================================================================
+// 19. HANDLE SUMMARY
+// =============================================================================
+//
+// Runs once after the test.
+//
+// All data here is already aggregated by k6.
+// =============================================================================
+
+export function handleSummary(data) {
+
+    const durationMs =
+        data.state &&
+            data.state.testRunDurationMs
+            ? data.state.testRunDurationMs
+            : 0;
+
+    const durationSec =
+        durationMs / 1000;
+
+    const endTime =
+        new Date();
+
+    const startTime =
+        new Date(
+            endTime.getTime() -
+            durationMs
+        );
+
+    // ===========================================================================
+    // OVERALL REQUESTS
+    // ===========================================================================
+
+    const overallReqs =
+        counterCount(
+            metric(
+                data,
+                'http_reqs'
+            )
+        );
+
+    const overallDurationM =
+        metric(
+            data,
+            'http_req_duration'
+        );
+
+    // ===========================================================================
+    // OVERALL STATUS CLASSES
+    // ===========================================================================
+    //
+    // Sum the bounded URL-level class metrics.
+    // This does NOT scan individual requests.
+    // ===========================================================================
+
+    const overallClassCounts = {};
+
+    STATUS_CLASSES.forEach((cls) => {
+
+        overallClassCounts[cls] =
+            CONFIG.urls.reduce(
+                (sum, u) => {
+
+                    return sum +
+                        counterCount(
+                            metric(
+                                data,
+                                urlClassTag(
+                                    'status_class_count',
+                                    u.id,
+                                    cls
+                                )
+                            )
+                        );
+                },
+                0
+            );
+    });
+
+    const overallFailed =
+        overallClassCounts['4xx'] +
+        overallClassCounts['5xx'] +
+        overallClassCounts['err'];
+
+    const overallPassed =
+        Math.max(
+            0,
+            overallReqs -
+            overallFailed
+        );
+
+    const overallErrorPct =
+        pct(
+            overallFailed,
+            overallReqs
+        );
+
+    const overallDropped =
+        counterCount(
+            metric(
+                data,
+                'dropped_iterations'
+            )
+        );
+
+    // ===========================================================================
+    // TARGET TPS
+    // ===========================================================================
+
+    const overallTargetTps =
+        CONFIG.phases.reduce(
+            (max, p) =>
+                Math.max(
+                    max,
+                    p.targetTPS
+                ),
+            0
+        );
+
+    // ===========================================================================
+    // OVERALL ACTUAL TPS
+    // ===========================================================================
+    //
+    // This is informational only because multiple phases can have different
+    // target rates.
+    //
+    // The authoritative TPS assessment is in the phase table.
+    // ===========================================================================
+
+    const overallActualTps =
+        durationSec > 0
+            ? overallReqs / durationSec
+            : 0;
+
+    // ===========================================================================
+    // OVERALL ACCEPTANCE
+    // ===========================================================================
+
+    const errOk =
+        overallErrorPct <=
+        CONFIG.reporting.maxErrorRatePct;
+
+    const dropOk =
+        overallDropped === 0;
+
+    // For multi-phase tests, phase-level TPS achievement is authoritative.
+    const allPhasesTpsOk =
+        CONFIG.phases.every((phase) => {
+
+            const phaseReqs =
+                counterCount(
+                    metric(
+                        data,
+                        phaseTag(
+                            'http_reqs',
+                            phase.name
+                        )
+                    )
+                );
+
+            const phaseDuration =
+                parseDurationToSeconds(
+                    phase.duration
+                );
+
+            const phaseActualTps =
+                phaseDuration > 0
+                    ? phaseReqs /
+                    phaseDuration
+                    : 0;
+
+            const achievement =
+                pct(
+                    phaseActualTps,
+                    phase.targetTPS
+                );
+
+            return achievement >=
+                CONFIG.reporting.minTpsAchievementPct;
+        });
+
+    const overallStatus =
+        allPhasesTpsOk &&
+            errOk &&
+            dropOk
+            ? 'PASS'
+            : 'FAIL';
+
+    // ===========================================================================
+    // FINAL SUMMARY OBJECT
+    // ===========================================================================
+
+    const summary = {
+
+        meta: {
+
+            testType:
+                CONFIG.testType,
+
+            startTime:
+                startTime.toISOString(),
+
+            endTime:
+                endTime.toISOString(),
+
+            durationSec,
+
+            pageCount:
+                CONFIG.urls.length,
+
+            phaseCount:
+                CONFIG.phases.length,
+        },
+
+        // -------------------------------------------------------------------------
+        // OVERALL
+        // -------------------------------------------------------------------------
+
+        overall: {
+
+            count:
+                overallReqs,
+
+            passed:
+                overallPassed,
+
+            failed:
+                overallFailed,
+
+            errorPct:
+                overallErrorPct,
+
+            targetTps:
+                overallTargetTps,
+
+            actualTps:
+                overallActualTps,
+
+            dropped:
+                overallDropped,
+
+            avg:
+                trendStat(
+                    overallDurationM,
+                    'avg'
+                ),
+
+            min:
+                trendStat(
+                    overallDurationM,
+                    'min'
+                ),
+
+            p90:
+                trendStat(
+                    overallDurationM,
+                    'p(90)'
+                ),
+
+            p95:
+                trendStat(
+                    overallDurationM,
+                    'p(95)'
+                ),
+
+            p99:
+                trendStat(
+                    overallDurationM,
+                    'p(99)'
+                ),
+
+            max:
+                trendStat(
+                    overallDurationM,
+                    'max'
+                ),
+
+            // vus_max is a Gauge, so use max rather than Counter.count.
+            vusMax:
+                gaugeMax(
+                    metric(
+                        data,
+                        'vus_max'
+                    )
+                ),
+
+            classCounts:
+                overallClassCounts,
+
+            status:
+                overallStatus,
+
+            tpsOk:
+                allPhasesTpsOk,
+
+            errOk,
+
+            dropOk,
+        },
+
+        // -------------------------------------------------------------------------
+        // PHASES
+        //
+        // Each phase contains pages[].
+        // -------------------------------------------------------------------------
+
+        phases:
+            CONFIG.phases.map(
+                (phase) =>
+                    buildPhaseRow(
+                        data,
+                        phase
+                    )
+            ),
+
+        // -------------------------------------------------------------------------
+        // CACHE
+        // -------------------------------------------------------------------------
+
+        cache:
+            CONFIG.urls.map(
+                (url) =>
+                    buildCacheRow(
+                        data,
+                        url
+                    )
+            ),
+
+        // -------------------------------------------------------------------------
+        // Native aggregate metrics.
+        //
+        // Retained for future dashboarding.
+        // -------------------------------------------------------------------------
+
+        nativeMetrics:
+            data.metrics,
+    };
+
+    return {
+
+        'k6-report.html':
+            buildHtmlReport(
+                summary
+            ),
+
+        'k6-summary.json':
+            JSON.stringify(
+                summary,
+                null,
+                2
+            ),
+
+        stdout:
+            textSummary(
+                data,
+                {
+                    indent: ' ',
+                    enableColors: true,
+                }
+            ) +
+            `\nTest complete. Overall status: ${summary.overall.status}. See k6-report.html and k6-summary.json.\n`,
+    };
+}
+
+
+
+
+=================================
+
+REPORTING HERE
+
+=======================================
+
+
+/**
+ * =============================================================================
+ * k6 Transaction-Wise Performance Report Generator
+ * =============================================================================
+ *
+ * Usage:
+ *   node generate-report.js k6-summary.json
+ *
+ * Output:
+ *   k6-performance-report.html
+ *
+ * Report:
+ *   - Executive summary
+ *   - Overall latency vs TPS
+ *   - Transaction-wise latency trends
+ *   - Transaction Avg/P90/P95/P99
+ *   - P95 vs P99 tail-latency analysis
+ *   - HTTP status distribution
+ *   - Actual HTTP status-code distribution when available
+ *   - Errors by transaction
+ *   - Errors by phase
+ *   - Target vs actual TPS
+ *   - Network timing
+ *   - Per-phase transaction accordions
+ *   - Resource accordions when resource data exists
+ *
+ * No k6 code is modified by this file.
+ * =============================================================================
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+// =============================================================================
+// INPUT / OUTPUT
+// =============================================================================
+
+const inputFile = process.argv[2] || 'k6-summary.json';
+
+const outputFile =
+    process.argv[3] ||
+    path.join(
+        path.dirname(path.resolve(inputFile)),
+        'k6-performance-report.html'
+    );
+
+// =============================================================================
+// LOAD SUMMARY
+// =============================================================================
+
+if (!fs.existsSync(inputFile)) {
+    console.error(`ERROR: Summary file not found: ${inputFile}`);
+    process.exit(1);
+}
+
+let summary;
+
+try {
+    summary = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
+} catch (err) {
+    console.error(`ERROR: Unable to parse ${inputFile}`);
+    console.error(err.message);
+    process.exit(1);
+}
+
+// =============================================================================
+// SAFE HELPERS
+// =============================================================================
+
+function num(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function int(value, fallback = 0) {
+    return Math.round(num(value, fallback));
+}
+
+function pct(value, digits = 2) {
+    return `${num(value).toFixed(digits)}%`;
+}
+
+function ms(value, digits = 2) {
+    return `${num(value).toFixed(digits)} ms`;
+}
+
+function formatNumber(value, digits = 2) {
+    const n = num(value);
+
+    return new Intl.NumberFormat('en-US', {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
+    }).format(n);
+}
+
+function formatInteger(value) {
+    return new Intl.NumberFormat('en-US', {
+        maximumFractionDigits: 0
+    }).format(int(value));
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function safeJson(value) {
+    return JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026');
+}
+
+function safeId(value) {
+    return String(value ?? '')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/^(\d)/, '_$1');
+}
+
+function average(values) {
+    const valid = values.filter(Number.isFinite);
+
+    if (!valid.length) {
+        return 0;
+    }
+
+    return valid.reduce((a, b) => a + b, 0) / valid.length;
+}
+
+function maxBy(items, selector) {
+    if (!items.length) {
+        return null;
+    }
+
+    return items.reduce((best, item) => {
+        return selector(item) > selector(best) ? item : best;
+    });
+}
+
+function minBy(items, selector) {
+    if (!items.length) {
+        return null;
+    }
+
+    return items.reduce((best, item) => {
+        return selector(item) < selector(best) ? item : best;
+    });
+}
+
+// =============================================================================
+// NORMALIZE PHASES
+// =============================================================================
+
+const phases = Array.isArray(summary.phases)
+    ? summary.phases.map((phase, index) => ({
+          ...phase,
+          __index: index
+      }))
+    : [];
+
+// Sort by actual target TPS for performance graphs.
+//
+// IMPORTANT:
+// We use targetTps rather than parsing "phase_4000tps" because the
+// scenario name may not actually represent the TPS value.
+const sortedPhases = [...phases].sort((a, b) => {
+    const ta = num(a.targetTps, Number.MAX_SAFE_INTEGER);
+    const tb = num(b.targetTps, Number.MAX_SAFE_INTEGER);
+
+    if (ta !== tb) {
+        return ta - tb;
+    }
+
+    return a.__index - b.__index;
+});
+
+// =============================================================================
+// DISCOVER TRANSACTIONS / PAGES
+// =============================================================================
+
+const pageMap = new Map();
+
+for (const phase of phases) {
+    const pages = Array.isArray(phase.pages) ? phase.pages : [];
+
+    for (const page of pages) {
+        const id = page.id || page.name || `page_${pageMap.size + 1}`;
+
+        if (!pageMap.has(id)) {
+            pageMap.set(id, {
+                id,
+                name: page.name || id,
+                url: page.url || ''
+            });
+        }
+    }
+}
+
+const pages = Array.from(pageMap.values());
+
+// =============================================================================
+// OVERALL METRICS
+// =============================================================================
+
+const overall = summary.overall || {};
+
+const overallCount = int(overall.count);
+const overallPassed = int(overall.passed);
+const overallFailed = int(overall.failed);
+
+const overallErrorPct =
+    overall.errorPct !== undefined
+        ? num(overall.errorPct)
+        : overallCount
+          ? (overallFailed / overallCount) * 100
+          : 0;
+
+const actualTps = num(overall.actualTps);
+const targetTps = num(overall.targetTps);
+
+const overallP95 = num(overall.p95);
+const overallP99 = num(overall.p99);
+const overallMax = num(overall.max);
+
+const dropped = int(overall.dropped);
+const vusMax = int(overall.vusMax);
+
+const overallStatus =
+    String(overall.status || '').toUpperCase() ||
+    (overallFailed > 0 ? 'FAIL' : 'PASS');
+
+// =============================================================================
+// BASELINE
+// =============================================================================
+
+const baselinePhase = sortedPhases.length
+    ? sortedPhases[0]
+    : null;
+
+const baselineP95 = baselinePhase
+    ? num(baselinePhase.p95)
+    : 0;
+
+const baselineP99 = baselinePhase
+    ? num(baselinePhase.p99)
+    : 0;
+
+function degradation(current, baseline) {
+    if (!baseline) {
+        return 0;
+    }
+
+    return ((current - baseline) / baseline) * 100;
+}
+
+const p95Degradation = degradation(overallP95, baselineP95);
+const p99Degradation = degradation(overallP99, baselineP99);
+
+// =============================================================================
+// WORST TRANSACTION / PHASE
+// =============================================================================
+
+let transactionRecords = [];
+
+for (const phase of phases) {
+    const phasePages = Array.isArray(phase.pages) ? phase.pages : [];
+
+    for (const page of phasePages) {
+        transactionRecords.push({
+            phase,
+            page,
+            p95: num(page.p95),
+            p99: num(page.p99),
+            max: num(page.max),
+            avg: num(page.avg),
+            errorPct: num(page.errorPct),
+            failed: int(page.failed)
+        });
+    }
+}
+
+const worstTransactionP95 =
+    maxBy(transactionRecords, x => x.p95) || null;
+
+const worstTransactionP99 =
+    maxBy(transactionRecords, x => x.p99) || null;
+
+const worstTransactionMax =
+    maxBy(transactionRecords, x => x.max) || null;
+
+const worstPhase =
+    maxBy(phases, phase => num(phase.p95)) || null;
+
+// =============================================================================
+// ANOMALY DETECTION
+// =============================================================================
+
+const anomalies = [];
+
+if (overallErrorPct > 0) {
+    anomalies.push({
+        severity: 'high',
+        title: 'HTTP / transaction errors detected',
+        detail: `${formatNumber(overallErrorPct)}% of transactions failed.`
+    });
+}
+
+if (dropped > 0) {
+    anomalies.push({
+        severity: 'high',
+        title: 'Dropped iterations detected',
+        detail: `${formatInteger(dropped)} iterations were dropped.`
+    });
+}
+
+if (worstTransactionP99 && worstTransactionP95 > 0) {
+    const tailRatio =
+        worstTransactionP99.p99 / worstTransactionP95.p95;
+
+    if (tailRatio >= 2) {
+        anomalies.push({
+            severity: 'high',
+            title: 'Tail latency anomaly',
+            detail:
+                `${worstTransactionP99.page.name} in ` +
+                `${worstTransactionP99.phase.phase} has P99 ` +
+                `${ms(worstTransactionP99.p99)} versus P95 ` +
+                `${ms(worstTransactionP99.p95)}.`
+        });
+    }
+}
+
+if (p95Degradation >= 50) {
+    anomalies.push({
+        severity: 'medium',
+        title: 'P95 degradation',
+        detail:
+            `Overall P95 is ${formatNumber(p95Degradation)}% higher ` +
+            `than the lowest-load baseline.`
+    });
+}
+
+if (p99Degradation >= 50) {
+    anomalies.push({
+        severity: 'high',
+        title: 'P99 degradation',
+        detail:
+            `Overall P99 is ${formatNumber(p99Degradation)}% higher ` +
+            `than the lowest-load baseline.`
+    });
+}
+
+if (
+    targetTps > 0 &&
+    actualTps > 0 &&
+    actualTps < targetTps * 0.95
+) {
+    anomalies.push({
+        severity: 'medium',
+        title: 'TPS achievement below target',
+        detail:
+            `Actual TPS ${formatNumber(actualTps)} is below ` +
+            `95% of target ${formatNumber(targetTps)} TPS.`
+    });
+}
+
+// =============================================================================
+// STATUS CLASS AGGREGATION
+// =============================================================================
+
+const overallStatusClasses = {
+    '2xx': 0,
+    '3xx': 0,
+    '4xx': 0,
+    '5xx': 0,
+    err: 0
+};
+
+for (const phase of phases) {
+    const cc = phase.classCounts || {};
+
+    for (const key of Object.keys(overallStatusClasses)) {
+        overallStatusClasses[key] += int(cc[key]);
+    }
+}
+
+// =============================================================================
+// DISCOVER ACTUAL HTTP STATUS CODES
+// =============================================================================
+//
+// The summary may contain:
+//   statusCounts
+//   httpStatusCounts
+//   statusCodeCounts
+//
+// We support all three common forms.
+//
+// Also search nativeMetrics for metrics that contain:
+//   status:200
+//   code:200
+//
+// This does not fabricate status codes when they aren't present.
+// =============================================================================
+
+const actualStatusCodes = {};
+
+function addStatusCode(code, count) {
+    const key = String(code);
+
+    if (/^\d{3}$/.test(key)) {
+        actualStatusCodes[key] =
+            (actualStatusCodes[key] || 0) + int(count);
+    }
+}
+
+function inspectStatusObject(obj) {
+    if (!obj || typeof obj !== 'object') {
+        return;
+    }
+
+    for (const [key, value] of Object.entries(obj)) {
+        if (/^\d{3}$/.test(key) && typeof value === 'number') {
+            addStatusCode(key, value);
+        }
+    }
+}
+
+inspectStatusObject(summary.statusCounts);
+inspectStatusObject(summary.httpStatusCounts);
+inspectStatusObject(summary.statusCodeCounts);
+
+if (summary.nativeMetrics && typeof summary.nativeMetrics === 'object') {
+    for (const [metricName, metricValue] of Object.entries(
+        summary.nativeMetrics
+    )) {
+        const match = metricName.match(
+            /(?:status|code)[=:._-]?(\d{3})/i
+        );
+
+        if (match) {
+            const count =
+                metricValue &&
+                typeof metricValue === 'object' &&
+                metricValue.count !== undefined
+                    ? metricValue.count
+                    : null;
+
+            if (count !== null) {
+                addStatusCode(match[1], count);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// CHART DATA
+// =============================================================================
+
+const chartData = {
+    phaseLabels: sortedPhases.map(
+        p => `${formatNumber(num(p.targetTps), 0)} TPS`
+    ),
+
+    targetTps: sortedPhases.map(p => num(p.targetTps)),
+
+    actualTps: sortedPhases.map(p => num(p.actualTps)),
+
+    overallAvg: sortedPhases.map(p => num(p.avg)),
+    overallP90: sortedPhases.map(p => num(p.p90)),
+    overallP95: sortedPhases.map(p => num(p.p95)),
+    overallP99: sortedPhases.map(p => num(p.p99)),
+    overallMax: sortedPhases.map(p => num(p.max)),
+
+    errorPct: sortedPhases.map(p => num(p.errorPct)),
+    dropped: sortedPhases.map(p => int(p.dropped))
+};
+
+// =============================================================================
+// TRANSACTION CHART DATA
+// =============================================================================
+
+const transactionCharts = {};
+
+for (const page of pages) {
+    const id = page.id;
+
+    transactionCharts[id] = {
+        name: page.name,
+        url: page.url,
+
+        avg: [],
+        p90: [],
+        p95: [],
+        p99: [],
+        max: [],
+        errorPct: [],
+        count: []
+    };
+
+    for (const phase of sortedPhases) {
+        const phasePage =
+            (phase.pages || []).find(
+                p => (p.id || p.name) === id
+            );
+
+        transactionCharts[id].avg.push(
+            phasePage ? num(phasePage.avg) : null
+        );
+
+        transactionCharts[id].p90.push(
+            phasePage ? num(phasePage.p90) : null
+        );
+
+        transactionCharts[id].p95.push(
+            phasePage ? num(phasePage.p95) : null
+        );
+
+        transactionCharts[id].p99.push(
+            phasePage ? num(phasePage.p99) : null
+        );
+
+        transactionCharts[id].max.push(
+            phasePage ? num(phasePage.max) : null
+        );
+
+        transactionCharts[id].errorPct.push(
+            phasePage ? num(phasePage.errorPct) : 0
+        );
+
+        transactionCharts[id].count.push(
+            phasePage ? int(phasePage.count) : 0
+        );
+    }
+}
+
+// =============================================================================
+// NETWORK DATA
+// =============================================================================
+
+const networkByPhase = sortedPhases.map(phase => {
+    const trends =
+        phase.networkMetrics &&
+        Array.isArray(phase.networkMetrics.trends)
+            ? phase.networkMetrics.trends
+            : [];
+
+    const result = {};
+
+    for (const trend of trends) {
+        result[trend.key] = num(trend.avg);
+    }
+
+    return result;
+});
+
+const networkKeys = [
+    'http_req_blocked',
+    'http_req_connecting',
+    'http_req_tls_handshaking',
+    'http_req_sending',
+    'http_req_waiting',
+    'http_req_receiving'
+];
+
+const networkLabels = {
+    http_req_blocked: 'Blocked',
+    http_req_connecting: 'Connecting',
+    http_req_tls_handshaking: 'TLS',
+    http_req_sending: 'Sending',
+    http_req_waiting: 'TTFB / Waiting',
+    http_req_receiving: 'Receiving'
+};
+
+// =============================================================================
+// RESOURCE DISCOVERY
+// =============================================================================
+
+function getPageResources(page) {
+    if (!page || typeof page !== 'object') {
+        return [];
+    }
+
+    const candidates = [
+        page.resources,
+        page.assets,
+        page.embeddedResources,
+        page.resourceMetrics
+    ];
+
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) {
+            return candidate;
+        }
+    }
+
+    return [];
+}
+
+const hasResources = phases.some(phase =>
+    (phase.pages || []).some(page =>
+        getPageResources(page).length > 0
+    )
+);
+
+// =============================================================================
+// HTML HELPERS
+// =============================================================================
+
+function statusBadge(status) {
+    const normalized = String(status || 'PASS').toUpperCase();
+
+    const cls =
+        normalized === 'PASS'
+            ? 'pass'
+            : normalized === 'WARN'
+              ? 'warn'
+              : 'fail';
+
+    return `<span class="badge ${cls}">${escapeHtml(normalized)}</span>`;
+}
+
+function metricCard(title, value, subtitle = '') {
+    return `
+        <div class="metric-card">
+            <div class="metric-title">${escapeHtml(title)}</div>
+            <div class="metric-value">${escapeHtml(value)}</div>
+            ${
+                subtitle
+                    ? `<div class="metric-subtitle">${escapeHtml(subtitle)}</div>`
+                    : ''
+            }
+        </div>
+    `;
+}
+
+function accordion(title, body, open = false) {
+    return `
+        <details class="accordion" ${open ? 'open' : ''}>
+            <summary>${title}</summary>
+            <div class="accordion-body">
+                ${body}
+            </div>
+        </details>
+    `;
+}
+
+// =============================================================================
+// PHASE TABLE
+// =============================================================================
+
+function buildPhaseTable() {
+    const rows = sortedPhases
+        .map(
+            phase => `
+            <tr>
+                <td>${escapeHtml(phase.phase || '')}</td>
+                <td>${formatNumber(phase.targetTps, 0)}</td>
+                <td>${formatNumber(phase.actualTps, 2)}</td>
+                <td>${formatNumber(phase.tpsAchievementPct, 2)}%</td>
+                <td>${formatInteger(phase.count)}</td>
+                <td>${ms(phase.avg)}</td>
+                <td>${ms(phase.p90)}</td>
+                <td>${ms(phase.p95)}</td>
+                <td>${ms(phase.p99)}</td>
+                <td>${ms(phase.max)}</td>
+                <td>${pct(phase.errorPct)}</td>
+                <td>${formatInteger(phase.dropped)}</td>
+                <td>${statusBadge(phase.status)}</td>
+            </tr>
+        `
+        )
+        .join('');
+
+    return `
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Phase</th>
+                        <th>Target TPS</th>
+                        <th>Actual TPS</th>
+                        <th>Achievement</th>
+                        <th>Count</th>
+                        <th>Avg</th>
+                        <th>P90</th>
+                        <th>P95</th>
+                        <th>P99</th>
+                        <th>Max</th>
+                        <th>Error</th>
+                        <th>Dropped</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
+}
+
+// =============================================================================
+// TRANSACTION TABLE
+// =============================================================================
+
+function buildTransactionTable() {
+    const rows = transactionRecords
+        .sort((a, b) => b.p95 - a.p95)
+        .map(
+            record => `
+            <tr>
+                <td>${escapeHtml(record.page.name)}</td>
+                <td>${escapeHtml(record.phase.phase || '')}</td>
+                <td>${formatNumber(record.phase.targetTps, 0)}</td>
+                <td>${ms(record.avg)}</td>
+                <td>${ms(record.p95)}</td>
+                <td>${ms(record.p99)}</td>
+                <td>${ms(record.max)}</td>
+                <td>${pct(record.errorPct)}</td>
+                <td>${formatInteger(record.failed)}</td>
+            </tr>
+        `
+        )
+        .join('');
+
+    return `
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Transaction</th>
+                        <th>Phase</th>
+                        <th>TPS</th>
+                        <th>Avg</th>
+                        <th>P95</th>
+                        <th>P99</th>
+                        <th>Max</th>
+                        <th>Error</th>
+                        <th>Failed</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
+}
+
+// =============================================================================
+// STATUS CLASS TABLE
+// =============================================================================
+
+function buildStatusClassTable() {
+    const total = Object.values(overallStatusClasses).reduce(
+        (a, b) => a + b,
+        0
+    );
+
+    const rows = Object.entries(overallStatusClasses)
+        .map(([status, count]) => {
+            const percentage =
+                total > 0 ? (count / total) * 100 : 0;
+
+            return `
+                <tr>
+                    <td>${escapeHtml(status)}</td>
+                    <td>${formatInteger(count)}</td>
+                    <td>${pct(percentage)}</td>
+                </tr>
+            `;
+        })
+        .join('');
+
+    return `
+        <div class="table-wrapper compact">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Status Class</th>
+                        <th>Count</th>
+                        <th>Percentage</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
+}
+
+// =============================================================================
+// ACTUAL STATUS CODE TABLE
+// =============================================================================
+
+function buildActualStatusTable() {
+    const entries = Object.entries(actualStatusCodes)
+        .sort((a, b) => Number(a[0]) - Number(b[0]));
+
+    if (!entries.length) {
+        return `
+            <div class="empty-state">
+                Individual HTTP status-code counts were not present
+                in the supplied summary JSON.
+                <br>
+                The report therefore uses the available 2xx/3xx/4xx/5xx
+                class counts instead of inventing individual codes.
+            </div>
+        `;
+    }
+
+    const total = entries.reduce(
+        (sum, [, count]) => sum + count,
+        0
+    );
+
+    const rows = entries
+        .map(([code, count]) => `
+            <tr>
+                <td><strong>${escapeHtml(code)}</strong></td>
+                <td>${formatInteger(count)}</td>
+                <td>${pct(total ? (count / total) * 100 : 0)}</td>
+            </tr>
+        `)
+        .join('');
+
+    return `
+        <div class="table-wrapper compact">
+            <table>
+                <thead>
+                    <tr>
+                        <th>HTTP Code</th>
+                        <th>Count</th>
+                        <th>Percentage</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
+}
+
+// =============================================================================
+// ERROR BY TRANSACTION
+// =============================================================================
+
+const transactionErrors = pages.map(page => {
+    let count = 0;
+    let total = 0;
+
+    for (const phase of phases) {
+        const p = (phase.pages || []).find(
+            x => (x.id || x.name) === page.id
+        );
+
+        if (p) {
+            total += int(p.count);
+            count += int(p.failed);
+        }
+    }
+
+    return {
+        name: page.name,
+        errors: count,
+        total
+    };
+});
+
+// =============================================================================
+// ERROR BY PHASE
+// =============================================================================
+
+const phaseErrors = sortedPhases.map(phase => ({
+    phase: `${formatNumber(phase.targetTps, 0)} TPS`,
+    errors: int(phase.failed),
+    total: int(phase.count)
+}));
+
+// =============================================================================
+// TRANSACTION SECTIONS
+// =============================================================================
+
+function buildTransactionSections() {
+    return pages
+        .map(page => {
+            const chart = transactionCharts[page.id];
+
+            const rows = sortedPhases
+                .map(phase => {
+                    const p = (phase.pages || []).find(
+                        x => (x.id || x.name) === page.id
+                    );
+
+                    if (!p) {
+                        return '';
+                    }
+
+                    return `
+                        <tr>
+                            <td>${formatNumber(phase.targetTps, 0)} TPS</td>
+                            <td>${formatInteger(p.count)}</td>
+                            <td>${ms(p.avg)}</td>
+                            <td>${ms(p.p90)}</td>
+                            <td>${ms(p.p95)}</td>
+                            <td>${ms(p.p99)}</td>
+                            <td>${ms(p.max)}</td>
+                            <td>${pct(p.errorPct)}</td>
+                            <td>${statusBadge(p.status)}</td>
+                        </tr>
+                    `;
+                })
+                .join('');
+
+            const resourceHtml = hasResources
+                ? buildResourceSections(page.id)
+                : '';
+
+            return `
+                <details class="accordion transaction-accordion">
+                    <summary>
+                        <span>
+                            ${escapeHtml(page.name)}
+                        </span>
+                        <span class="summary-meta">
+                            ${escapeHtml(page.url || '')}
+                        </span>
+                    </summary>
+
+                    <div class="accordion-body">
+
+                        <div class="chart-grid two">
+                            <div class="chart-panel">
+                                <div class="chart-title">
+                                    ${escapeHtml(page.name)} -
+                                    Avg / P90 / P95 / P99
+                                </div>
+                                <div class="chart-container">
+                                    <canvas id="chart-${safeId(page.id)}-percentiles"></canvas>
+                                </div>
+                            </div>
+
+                            <div class="chart-panel">
+                                <div class="chart-title">
+                                    ${escapeHtml(page.name)} -
+                                    P95 vs P99
+                                </div>
+                                <div class="chart-container">
+                                    <canvas id="chart-${safeId(page.id)}-tail"></canvas>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="chart-grid two">
+                            <div class="chart-panel">
+                                <div class="chart-title">
+                                    ${escapeHtml(page.name)} -
+                                    Error Rate
+                                </div>
+                                <div class="chart-container">
+                                    <canvas id="chart-${safeId(page.id)}-errors"></canvas>
+                                </div>
+                            </div>
+
+                            <div class="chart-panel">
+                                <div class="chart-title">
+                                    ${escapeHtml(page.name)} -
+                                    Transaction Volume
+                                </div>
+                                <div class="chart-container">
+                                    <canvas id="chart-${safeId(page.id)}-count"></canvas>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="table-wrapper">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Target TPS</th>
+                                        <th>Count</th>
+                                        <th>Avg</th>
+                                        <th>P90</th>
+                                        <th>P95</th>
+                                        <th>P99</th>
+                                        <th>Max</th>
+                                        <th>Error</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${rows}</tbody>
+                            </table>
+                        </div>
+
+                        ${resourceHtml}
+
+                    </div>
+                </details>
+            `;
+        })
+        .join('');
+}
+
+// =============================================================================
+// RESOURCE SECTIONS
+// =============================================================================
+
+function buildResourceSections(pageId) {
+    const resourceRows = [];
+
+    for (const phase of sortedPhases) {
+        const page = (phase.pages || []).find(
+            p => (p.id || p.name) === pageId
+        );
+
+        if (!page) {
+            continue;
+        }
+
+        for (const resource of getPageResources(page)) {
+            resourceRows.push({
+                phase,
+                resource
+            });
+        }
+    }
+
+    if (!resourceRows.length) {
+        return '';
+    }
+
+    const rows = resourceRows
+        .map(({ phase, resource }) => {
+            const name =
+                resource.name ||
+                resource.url ||
+                resource.path ||
+                resource.id ||
+                'Resource';
+
+            return `
+                <tr>
+                    <td>${formatNumber(phase.targetTps, 0)} TPS</td>
+                    <td class="resource-url">
+                        ${escapeHtml(name)}
+                    </td>
+                    <td>${formatInteger(resource.count)}</td>
+                    <td>${ms(resource.avg)}</td>
+                    <td>${ms(resource.p90)}</td>
+                    <td>${ms(resource.p95)}</td>
+                    <td>${ms(resource.p99)}</td>
+                    <td>${ms(resource.max)}</td>
+                    <td>${pct(resource.errorPct)}</td>
+                </tr>
+            `;
+        })
+        .join('');
+
+    return `
+        <details class="accordion resource-accordion">
+            <summary>
+                Embedded Resources
+            </summary>
+
+            <div class="accordion-body">
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>TPS</th>
+                                <th>Resource</th>
+                                <th>Count</th>
+                                <th>Avg</th>
+                                <th>P90</th>
+                                <th>P95</th>
+                                <th>P99</th>
+                                <th>Max</th>
+                                <th>Error</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+    `;
+}
+
+// =============================================================================
+// ANOMALY HTML
+// =============================================================================
+
+function buildAnomalies() {
+    if (!anomalies.length) {
+        return `
+            <div class="no-anomaly">
+                No major performance anomalies detected from the
+                supplied summary metrics.
+            </div>
+        `;
+    }
+
+    return anomalies
+        .map(
+            anomaly => `
+                <div class="anomaly ${escapeHtml(anomaly.severity)}">
+                    <div class="anomaly-title">
+                        ${escapeHtml(anomaly.title)}
+                    </div>
+                    <div class="anomaly-detail">
+                        ${escapeHtml(anomaly.detail)}
+                    </div>
+                </div>
+            `
+        )
+        .join('');
+}
+
+// =============================================================================
+// CACHE INFORMATION
+// =============================================================================
+
+function buildCacheSection() {
+    if (!Array.isArray(summary.cache) || !summary.cache.length) {
+        return '';
+    }
+
+    const rows = summary.cache
+        .map(item => `
+            <tr>
+                <td>${escapeHtml(item.name || item.id || '')}</td>
+                <td>${escapeHtml(item.strategy || '')}</td>
+                <td>${escapeHtml(item.note || '')}</td>
+            </tr>
+        `)
+        .join('');
+
+    return `
+        <section class="section">
+            <div class="section-header">
+                <h2>Cache Observability</h2>
+            </div>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Transaction</th>
+                            <th>Strategy</th>
+                            <th>Observation</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
+        </section>
+    `;
+}
+
+// =============================================================================
+// HTML
+// =============================================================================
+
+const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>k6 Performance Report</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+:root {
+    --bg: #f4f6f8;
+    --surface: #ffffff;
+    --surface-alt: #f8fafc;
+    --text: #18212f;
+    --muted: #667085;
+    --border: #dfe4ea;
+    --accent: #2563eb;
+    --success: #15803d;
+    --warning: #b45309;
+    --danger: #b91c1c;
+    --shadow: 0 2px 8px rgba(0,0,0,.06);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family:
+        Inter,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Arial,
+        sans-serif;
+}
+
+.container {
+    width: min(1500px, calc(100% - 40px));
+    margin: 0 auto;
+}
+
+.header {
+    background: #111827;
+    color: white;
+    padding: 28px 0;
+}
+
+.header h1 {
+    margin: 0 0 8px;
+    font-size: 27px;
+}
+
+.header p {
+    margin: 0;
+    color: #cbd5e1;
+}
+
+.section {
+    margin: 28px 0;
+}
+
+.section-header {
+    margin-bottom: 15px;
+}
+
+.section-header h2 {
+    margin: 0;
+    font-size: 21px;
+}
+
+.section-header p {
+    margin: 5px 0 0;
+    color: var(--muted);
+}
+
+.kpi-grid {
+    display: grid;
+    grid-template-columns:
+        repeat(6, minmax(0, 1fr));
+    gap: 14px;
+    margin: 25px 0;
+}
+
+.metric-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 17px;
+    box-shadow: var(--shadow);
+}
+
+.metric-title {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+
+.metric-value {
+    font-size: 25px;
+    font-weight: 700;
+    margin-top: 8px;
+}
+
+.metric-subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 5px;
+}
+
+.chart-grid {
+    display: grid;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.chart-grid.two {
+    grid-template-columns:
+        repeat(2, minmax(0, 1fr));
+}
+
+.chart-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    box-shadow: var(--shadow);
+}
+
+.chart-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 15px;
+}
+
+.chart-container {
+    position: relative;
+    height: 320px;
+}
+
+.chart-container.small {
+    height: 280px;
+}
+
+.table-wrapper {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+}
+
+.table-wrapper.compact {
+    box-shadow: none;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+th {
+    background: var(--surface-alt);
+    color: #475467;
+    font-weight: 700;
+    text-align: left;
+    white-space: nowrap;
+}
+
+th,
+td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+tr:last-child td {
+    border-bottom: 0;
+}
+
+.badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.badge.pass {
+    color: var(--success);
+    background: #dcfce7;
+}
+
+.badge.warn {
+    color: var(--warning);
+    background: #fef3c7;
+}
+
+.badge.fail {
+    color: var(--danger);
+    background: #fee2e2;
+}
+
+.accordion {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+}
+
+.accordion summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 16px 18px;
+    font-weight: 700;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.accordion summary::-webkit-details-marker {
+    display: none;
+}
+
+.accordion summary::before {
+    content: "▶";
+    font-size: 10px;
+    margin-right: 10px;
+    transition: transform .2s;
+}
+
+.accordion[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.accordion-body {
+    border-top: 1px solid var(--border);
+    padding: 18px;
+}
+
+.summary-meta {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 400;
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.transaction-accordion {
+    margin-bottom: 14px;
+}
+
+.resource-accordion {
+    box-shadow: none;
+    margin-top: 18px;
+}
+
+.resource-url {
+    max-width: 450px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.anomaly {
+    border-left: 4px solid;
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 13px 16px;
+    margin-bottom: 10px;
+}
+
+.anomaly.high {
+    border-color: var(--danger);
+}
+
+.anomaly.medium {
+    border-color: var(--warning);
+}
+
+.anomaly.low {
+    border-color: var(--accent);
+}
+
+.anomaly-title {
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.anomaly-detail {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.no-anomaly {
+    background: #ecfdf3;
+    border: 1px solid #bbf7d0;
+    color: var(--success);
+    padding: 15px;
+    border-radius: 8px;
+}
+
+.empty-state {
+    background: var(--surface-alt);
+    border: 1px dashed var(--border);
+    padding: 18px;
+    border-radius: 8px;
+    color: var(--muted);
+    line-height: 1.6;
+}
+
+.footer {
+    padding: 30px 0 50px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+@media (max-width: 1200px) {
+    .kpi-grid {
+        grid-template-columns:
+            repeat(3, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 850px) {
+    .chart-grid.two {
+        grid-template-columns: 1fr;
+    }
+
+    .kpi-grid {
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr));
+    }
+
+    .container {
+        width: min(100% - 20px, 1500px);
+    }
+}
+
+@media (max-width: 550px) {
+    .kpi-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+</style>
+</head>
+
+<body>
+
+<header class="header">
+    <div class="container">
+        <h1>k6 Performance Test Report</h1>
+        <p>
+            Transaction-wise performance, latency, HTTP status,
+            network timing and load analysis
+        </p>
+    </div>
+</header>
+
+<main class="container">
+
+    <!-- ============================================================= -->
+    <!-- EXECUTIVE SUMMARY                                             -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Executive Summary</h2>
+            <p>
+                Test type:
+                ${escapeHtml(summary.meta?.testType || 'Load Test')}
+                |
+                Duration:
+                ${formatNumber(summary.meta?.durationSec, 2)} sec
+            </p>
+        </div>
+
+        <div class="kpi-grid">
+
+            ${metricCard(
+                'Transactions',
+                formatInteger(overallCount),
+                `${formatInteger(overallPassed)} passed`
+            )}
+
+            ${metricCard(
+                'Actual TPS',
+                formatNumber(actualTps, 2),
+                `Target ${formatNumber(targetTps, 2)} TPS`
+            )}
+
+            ${metricCard(
+                'P95',
+                ms(overallP95),
+                `Baseline ${ms(baselineP95)}`
+            )}
+
+            ${metricCard(
+                'P99',
+                ms(overallP99),
+                `Baseline ${ms(baselineP99)}`
+            )}
+
+            ${metricCard(
+                'Errors',
+                pct(overallErrorPct),
+                `${formatInteger(overallFailed)} failed`
+            )}
+
+            ${metricCard(
+                'Dropped',
+                formatInteger(dropped),
+                `Max VUs ${formatInteger(vusMax)}`
+            )}
+
+        </div>
+
+        <div>
+            ${statusBadge(overallStatus)}
+        </div>
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- ANOMALIES                                                     -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Performance Findings</h2>
+            <p>
+                Automatically detected latency, error, TPS and
+                tail-performance observations.
+            </p>
+        </div>
+
+        ${buildAnomalies()}
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- OVERALL PERFORMANCE                                           -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Overall Performance Trend</h2>
+            <p>
+                Response-time behavior across the load phases.
+            </p>
+        </div>
+
+        <div class="chart-grid two">
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Overall Avg / P90 / P95 / P99 vs TPS
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="overallLatencyChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Target TPS vs Actual TPS
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="tpsChart"></canvas>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="chart-grid two">
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Overall Error Rate vs TPS
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="errorRateChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Dropped Iterations vs TPS
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="droppedChart"></canvas>
+                </div>
+            </div>
+
+        </div>
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- PHASE SUMMARY                                                 -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Phase Summary</h2>
+            <p>
+                Complete phase-level transaction statistics.
+            </p>
+        </div>
+
+        ${buildPhaseTable()}
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- TRANSACTION PERFORMANCE                                       -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Transaction Performance</h2>
+            <p>
+                Each page/transaction is shown independently so that
+                latency degradation is not hidden by overall aggregation.
+            </p>
+        </div>
+
+        ${buildTransactionSections()}
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- TRANSACTION RANKING                                           -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Transaction Performance Ranking</h2>
+            <p>
+                Transactions ranked by P95 latency across phases.
+            </p>
+        </div>
+
+        ${buildTransactionTable()}
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- HTTP STATUS                                                   -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>HTTP Status Analysis</h2>
+            <p>
+                Status-class and individual status-code distribution.
+            </p>
+        </div>
+
+        <div class="chart-grid two">
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Overall HTTP Status Distribution
+                </div>
+
+                <div class="chart-container small">
+                    <canvas id="statusClassPie"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Errors by Transaction
+                </div>
+
+                <div class="chart-container small">
+                    <canvas id="errorsByTransaction"></canvas>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="chart-grid two">
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Errors by Phase
+                </div>
+
+                <div class="chart-container small">
+                    <canvas id="errorsByPhase"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    HTTP Status Code Distribution
+                </div>
+
+                <div class="chart-container small">
+                    <canvas id="statusCodePie"></canvas>
+                </div>
+            </div>
+
+        </div>
+
+        <h3>Status Classes</h3>
+        ${buildStatusClassTable()}
+
+        <br>
+
+        <h3>Individual Status Codes</h3>
+        ${buildActualStatusTable()}
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- NETWORK                                                       -->
+    <!-- ============================================================= -->
+
+    <section class="section">
+
+        <div class="section-header">
+            <h2>Network Timing</h2>
+            <p>
+                Average network timing components across load phases.
+            </p>
+        </div>
+
+        <div class="chart-grid two">
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    Network Timing vs TPS
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="networkChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-panel">
+                <div class="chart-title">
+                    TTFB / Waiting vs TPS
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="ttfbChart"></canvas>
+                </div>
+            </div>
+
+        </div>
+
+    </section>
+
+    <!-- ============================================================= -->
+    <!-- CACHE                                                         -->
+    <!-- ============================================================= -->
+
+    ${buildCacheSection()}
+
+</main>
+
+<footer class="footer">
+    <div class="container">
+        Generated from:
+        ${escapeHtml(path.basename(inputFile))}
+    </div>
+</footer>
+
+<script>
+
+const REPORT_DATA = ${safeJson({
+    phaseLabels: chartData.phaseLabels,
+    targetTps: chartData.targetTps,
+    actualTps: chartData.actualTps,
+    overallAvg: chartData.overallAvg,
+    overallP90: chartData.overallP90,
+    overallP95: chartData.overallP95,
+    overallP99: chartData.overallP99,
+    overallMax: chartData.overallMax,
+    errorPct: chartData.errorPct,
+    dropped: chartData.dropped,
+    transactionCharts,
+    pages: pages.map(p => ({
+        id: p.id,
+        name: p.name
+    })),
+    statusClasses: overallStatusClasses,
+    statusCodes: actualStatusCodes,
+    transactionErrors,
+    phaseErrors,
+    networkByPhase,
+    networkKeys,
+    networkLabels
+})};
+
+// =============================================================================
+// CHART DEFAULTS
+// =============================================================================
+
+Chart.defaults.font.family =
+    'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
+
+Chart.defaults.plugins.legend.position = 'bottom';
+
+Chart.defaults.plugins.tooltip.mode = 'index';
+
+Chart.defaults.plugins.tooltip.intersect = false;
+
+// =============================================================================
+// COMMON CONFIG
+// =============================================================================
+
+function lineOptions(title, beginAtZero = false) {
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+
+        interaction: {
+            mode: 'index',
+            intersect: false
+        },
+
+        scales: {
+            y: {
+                beginAtZero,
+                ticks: {
+                    callback: value => value + ' ms'
+                }
+            }
+        }
+    };
+}
+
+function countOptions() {
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+
+        interaction: {
+            mode: 'index',
+            intersect: false
+        },
+
+        scales: {
+            y: {
+                beginAtZero: true
+            }
+        }
+    };
+}
+
+// =============================================================================
+// OVERALL LATENCY
+// =============================================================================
+
+new Chart(
+    document.getElementById('overallLatencyChart'),
+    {
+        type: 'line',
+
+        data: {
+            labels: REPORT_DATA.phaseLabels,
+
+            datasets: [
+                {
+                    label: 'Average',
+                    data: REPORT_DATA.overallAvg,
+                    tension: .25
+                },
+                {
+                    label: 'P90',
+                    data: REPORT_DATA.overallP90,
+                    tension: .25
+                },
+                {
+                    label: 'P95',
+                    data: REPORT_DATA.overallP95,
+                    tension: .25
+                },
+                {
+                    label: 'P99',
+                    data: REPORT_DATA.overallP99,
+                    tension: .25
+                }
+            ]
+        },
+
+        options: lineOptions()
+    }
+);
+
+// =============================================================================
+// TARGET VS ACTUAL TPS
+// =============================================================================
+
+new Chart(
+    document.getElementById('tpsChart'),
+    {
+        type: 'line',
+
+        data: {
+            labels: REPORT_DATA.phaseLabels,
+
+            datasets: [
+                {
+                    label: 'Target TPS',
+                    data: REPORT_DATA.targetTps,
+                    tension: .25
+                },
+                {
+                    label: 'Actual TPS',
+                    data: REPORT_DATA.actualTps,
+                    tension: .25
+                }
+            ]
+        },
+
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        callback: value => value + ' TPS'
+                    }
+                }
+            }
+        }
+    }
+);
+
+// =============================================================================
+// ERROR RATE
+// =============================================================================
+
+new Chart(
+    document.getElementById('errorRateChart'),
+    {
+        type: 'line',
+
+        data: {
+            labels: REPORT_DATA.phaseLabels,
+
+            datasets: [
+                {
+                    label: 'Error Rate',
+                    data: REPORT_DATA.errorPct,
+                    tension: .25
+                }
+            ]
+        },
+
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        callback: value => value + '%'
+                    }
+                }
+            }
+        }
+    }
+);
+
+// =============================================================================
+// DROPPED
+// =============================================================================
+
+new Chart(
+    document.getElementById('droppedChart'),
+    {
+        type: 'line',
+
+        data: {
+            labels: REPORT_DATA.phaseLabels,
+
+            datasets: [
+                {
+                    label: 'Dropped Iterations',
+                    data: REPORT_DATA.dropped,
+                    tension: .25
+                }
+            ]
+        },
+
+        options: countOptions()
+    }
+);
+
+// =============================================================================
+// TRANSACTION CHARTS
+// =============================================================================
+
+for (const page of REPORT_DATA.pages) {
+
+    const data = REPORT_DATA.transactionCharts[page.id];
+
+    if (!data) {
+        continue;
+    }
+
+    const id = ${JSON.stringify('')};
+
+    const baseId =
+        'chart-' +
+        page.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+    // ---------------------------------------------------------------
+    // Percentiles
+    // ---------------------------------------------------------------
+
+    const percentileCanvas =
+        document.getElementById(
+            baseId + '-percentiles'
+        );
+
+    if (percentileCanvas) {
+
+        new Chart(
+            percentileCanvas,
+            {
+                type: 'line',
+
+                data: {
+                    labels: REPORT_DATA.phaseLabels,
+
+                    datasets: [
+                        {
+                            label: 'Average',
+                            data: data.avg,
+                            tension: .25
+                        },
+                        {
+                            label: 'P90',
+                            data: data.p90,
+                            tension: .25
+                        },
+                        {
+                            label: 'P95',
+                            data: data.p95,
+                            tension: .25
+                        },
+                        {
+                            label: 'P99',
+                            data: data.p99,
+                            tension: .25
+                        }
+                    ]
+                },
+
+                options: lineOptions()
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // P95 vs P99
+    // ---------------------------------------------------------------
+
+    const tailCanvas =
+        document.getElementById(
+            baseId + '-tail'
+        );
+
+    if (tailCanvas) {
+
+        new Chart(
+            tailCanvas,
+            {
+                type: 'line',
+
+                data: {
+                    labels: REPORT_DATA.phaseLabels,
+
+                    datasets: [
+                        {
+                            label: 'P95',
+                            data: data.p95,
+                            tension: .25
+                        },
+                        {
+                            label: 'P99',
+                            data: data.p99,
+                            tension: .25
+                        },
+                        {
+                            label: 'Max',
+                            data: data.max,
+                            tension: .25
+                        }
+                    ]
+                },
+
+                options: lineOptions()
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Error Rate
+    // ---------------------------------------------------------------
+
+    const errorCanvas =
+        document.getElementById(
+            baseId + '-errors'
+        );
+
+    if (errorCanvas) {
+
+        new Chart(
+            errorCanvas,
+            {
+                type: 'line',
+
+                data: {
+                    labels: REPORT_DATA.phaseLabels,
+
+                    datasets: [
+                        {
+                            label: 'Error Rate',
+                            data: data.errorPct,
+                            tension: .25
+                        }
+                    ]
+                },
+
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: value => value + '%'
+                            }
+                        }
+                    }
+                }
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Transaction Volume
+    // ---------------------------------------------------------------
+
+    const countCanvas =
+        document.getElementById(
+            baseId + '-count'
+        );
+
+    if (countCanvas) {
+
+        new Chart(
+            countCanvas,
+            {
+                type: 'bar',
+
+                data: {
+                    labels: REPORT_DATA.phaseLabels,
+
+                    datasets: [
+                        {
+                            label: 'Transactions',
+                            data: data.count
+                        }
+                    ]
+                },
+
+                options: countOptions()
+            }
+        );
+    }
+}
+
+// =============================================================================
+// STATUS CLASS PIE
+// =============================================================================
+
+new Chart(
+    document.getElementById('statusClassPie'),
+    {
+        type: 'pie',
+
+        data: {
+            labels: Object.keys(
+                REPORT_DATA.statusClasses
+            ),
+
+            datasets: [
+                {
+                    data: Object.values(
+                        REPORT_DATA.statusClasses
+                    )
+                }
+            ]
+        },
+
+        options: {
+            responsive: true,
+            maintainAspectRatio: false
+        }
+    }
+);
+
+// =============================================================================
+// ACTUAL STATUS CODE PIE
+// =============================================================================
+
+const statusCodeCanvas =
+    document.getElementById('statusCodePie');
+
+const statusCodeEntries =
+    Object.entries(REPORT_DATA.statusCodes);
+
+if (statusCodeEntries.length) {
+
+    new Chart(
+        statusCodeCanvas,
+        {
+            type: 'pie',
+
+            data: {
+                labels: statusCodeEntries.map(
+                    ([code]) => code
+                ),
+
+                datasets: [
+                    {
+                        data: statusCodeEntries.map(
+                            ([, count]) => count
+                        )
+                    }
+                ]
+            },
+
+            options: {
+                responsive: true,
+                maintainAspectRatio: false
+            }
+        }
+    );
+
+} else {
+
+    const ctx =
+        statusCodeCanvas.getContext('2d');
+
+    ctx.font = '14px Arial';
+    ctx.fillText(
+        'No individual HTTP status-code data available',
+        20,
+        50
+    );
+}
+
+// =============================================================================
+// ERRORS BY TRANSACTION
+// =============================================================================
+
+new Chart(
+    document.getElementById('errorsByTransaction'),
+    {
+        type: 'bar',
+
+        data: {
+            labels:
+                REPORT_DATA.transactionErrors.map(
+                    x => x.name
+                ),
+
+            datasets: [
+                {
+                    label: 'Failed Transactions',
+
+                    data:
+                        REPORT_DATA.transactionErrors.map(
+                            x => x.errors
+                        )
+                }
+            ]
+        },
+
+        options: countOptions()
+    }
+);
+
+// =============================================================================
+// ERRORS BY PHASE
+// =============================================================================
+
+new Chart(
+    document.getElementById('errorsByPhase'),
+    {
+        type: 'bar',
+
+        data: {
+            labels:
+                REPORT_DATA.phaseErrors.map(
+                    x => x.phase
+                ),
+
+            datasets: [
+                {
+                    label: 'Failed Transactions',
+
+                    data:
+                        REPORT_DATA.phaseErrors.map(
+                            x => x.errors
+                        )
+                }
+            ]
+        },
+
+        options: countOptions()
+    }
+);
+
+// =============================================================================
+// NETWORK TIMING
+// =============================================================================
+
+const networkDatasets =
+    REPORT_DATA.networkKeys.map(key => ({
+        label: REPORT_DATA.networkLabels[key] || key,
+
+        data:
+            REPORT_DATA.networkByPhase.map(
+                phase => phase[key] || 0
+            ),
+
+        tension: .25
+    }));
+
+new Chart(
+    document.getElementById('networkChart'),
+    {
+        type: 'line',
+
+        data: {
+            labels: REPORT_DATA.phaseLabels,
+            datasets: networkDatasets
+        },
+
+        options: lineOptions()
+    }
+);
+
+// =============================================================================
+// TTFB
+// =============================================================================
+
+new Chart(
+    document.getElementById('ttfbChart'),
+    {
+        type: 'line',
+
+        data: {
+            labels: REPORT_DATA.phaseLabels,
+
+            datasets: [
+                {
+                    label: 'TTFB / Waiting',
+
+                    data:
+                        REPORT_DATA.networkByPhase.map(
+                            phase =>
+                                phase.http_req_waiting || 0
+                        ),
+
+                    tension: .25
+                }
+            ]
+        },
+
+        options: lineOptions()
+    }
+);
+
+</script>
+
+</body>
+</html>`;
+
+// =============================================================================
+// WRITE FILE
+// =============================================================================
+
+try {
+    fs.writeFileSync(outputFile, html, 'utf8');
+
+    console.log('');
+    console.log('============================================================');
+    console.log('k6 Performance Report Generated');
+    console.log('============================================================');
+    console.log(`Input : ${path.resolve(inputFile)}`);
+    console.log(`Output: ${path.resolve(outputFile)}`);
+    console.log('');
+    console.log(`Transactions : ${formatInteger(overallCount)}`);
+    console.log(`Actual TPS   : ${formatNumber(actualTps, 2)}`);
+    console.log(`P95          : ${ms(overallP95)}`);
+    console.log(`P99          : ${ms(overallP99)}`);
+    console.log(`Errors       : ${pct(overallErrorPct)}`);
+    console.log(`Dropped      : ${formatInteger(dropped)}`);
+    console.log(`Status       : ${overallStatus}`);
+    console.log('');
+
+    if (worstTransactionP95) {
+        console.log(
+            `Worst P95    : ${worstTransactionP95.page.name} ` +
+            `@ ${formatNumber(worstTransactionP95.phase.targetTps, 0)} TPS ` +
+            `(${ms(worstTransactionP95.p95)})`
+        );
+    }
+
+    if (worstTransactionP99) {
+        console.log(
+            `Worst P99    : ${worstTransactionP99.page.name} ` +
+            `@ ${formatNumber(worstTransactionP99.phase.targetTps, 0)} TPS ` +
+            `(${ms(worstTransactionP99.p99)})`
+        );
+    }
+
+    if (worstTransactionMax) {
+        console.log(
+            `Worst Max    : ${worstTransactionMax.page.name} ` +
+            `@ ${formatNumber(worstTransactionMax.phase.targetTps, 0)} TPS ` +
+            `(${ms(worstTransactionMax.max)})`
+        );
+    }
+
+    console.log(
+        `Anomalies    : ${formatInteger(anomalies.length)}`
+    );
+
+    console.log('============================================================');
+    console.log('');
+
+} catch (err) {
+    console.error(
+        `ERROR: Unable to write report: ${err.message}`
+    );
+
+    process.exit(1);
+}
+
+
