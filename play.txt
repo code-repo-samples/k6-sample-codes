@@ -1,0 +1,832 @@
+Playwright.config · JS
+
+
+
+// @ts-check
+const { defineConfig, devices } = require('@playwright/test');
+
+module.exports = defineConfig({
+  testDir: './tests',
+  fullyParallel: false,          // shared test data (programs list) - keep serial
+  retries: 1,
+  timeout: 60_000,
+
+  use: {
+    baseURL: 'https://ui-gcp.alpha.codes.coke.com',
+    trace: 'on',                 // full step-by-step trace, screenshots per action
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+    actionTimeout: 15_000,
+  },
+
+  reporter: [
+    ['list'],
+    ['html', { open: 'never', outputFolder: 'playwright-report' }],
+    ['json', { outputFile: 'test-results/results.json' }],
+  ],
+
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+  ],
+});
+
+
+
+==
+
+package
+
+{
+  "name": "coke-codes-ui-automation",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "codegen": "playwright codegen https://ui-gcp.alpha.codes.coke.com/programs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
+
+
+===
+
+programs page
+
+
+
+const { expect } = require('@playwright/test');
+
+class ProgramsPage {
+  /** @param {import('@playwright/test').Page} page */
+  constructor(page) {
+    this.page = page;
+    this.createNewBtn = page.getByRole('button', { name: /create new/i });
+    this.rows = page.locator('table tbody tr');
+  }
+
+  async goto() {
+    await this.page.goto('/programs');
+    await expect(this.page.getByRole('heading', { name: 'Programs' })).toBeVisible();
+  }
+
+  async openCreateNewProgram() {
+    await this.createNewBtn.click();
+  }
+
+  async openProgramByName(name) {
+    await this.page.getByRole('row', { name: new RegExp(name) }).click();
+  }
+
+  async rowCount() {
+    return this.rows.count();
+  }
+}
+
+module.exports = { ProgramsPage };
+
+
+
+====
+
+
+Createprogrammodal · JS
+
+
+
+const { expect } = require('@playwright/test');
+
+/**
+ * Models the "Create New Program" modal seen across 3 scrollable sections:
+ *  1. Program details (text fields, timezone/market/owner dropdowns, date pickers)
+ *  2. Redemption rules (max attempts / per / period) + Profanity/Checksum checkboxes
+ *     + Risk Calculator (Check Risk button, Show Examples link)
+ *  3. Character set configuration (3 columns of checkboxes: digits / lowercase / uppercase)
+ */
+class CreateProgramModal {
+  /** @param {import('@playwright/test').Page} page */
+  constructor(page) {
+    this.page = page;
+    this.dialog = page.getByRole('dialog').filter({ hasText: 'Create New Program' });
+
+    // Step 1
+    this.programName = this.dialog.getByLabel('Program Name');
+    this.programDescription = this.dialog.getByLabel('Program Description');
+    this.startDateTimezone = this.dialog.getByLabel('Start Date Timezone');
+    this.startDate = this.dialog.getByLabel('Start Date');
+    this.endDateTimezone = this.dialog.getByLabel('End Date Timezone');
+    this.endDate = this.dialog.getByLabel('End Date');
+    this.activeMarket = this.dialog.getByLabel('Active Market');
+    this.ownerGroup = this.dialog.getByLabel('Owner Group');
+
+    // Redemption rules
+    this.maxValidAttempts = this.dialog.getByLabel('Max valid attempts');
+    this.perValue = this.dialog.locator('input').nth(0); // adjust: unlabeled "per" input
+    this.periodDropdown = this.dialog.getByLabel('period');
+    this.profanityCheckbox = this.dialog.getByRole('checkbox', { name: 'Enable Profanity Check' });
+    this.luhnsChecksumCheckbox = this.dialog.getByRole('checkbox', { name: /Add Checksum Using Luhns/i });
+
+    // Risk calculator
+    this.checkRiskBtn = this.dialog.getByRole('button', { name: 'CHECK RISK' });
+    this.showExamplesBtn = this.dialog.getByRole('button', { name: 'SHOW EXAMPLES' });
+    this.riskGauge = this.dialog.locator('[data-testid="risk-gauge"]'); // adjust to real selector
+
+    // Character set config
+    this.selectAllDigits = this.dialog.getByRole('checkbox', { name: 'Select All' }).nth(0);
+    this.selectAllLower = this.dialog.getByRole('checkbox', { name: 'Select All' }).nth(1);
+    this.selectAllUpper = this.dialog.getByRole('checkbox', { name: 'Select All' }).nth(2);
+
+    this.saveBtn = this.dialog.getByRole('button', { name: 'SAVE' });
+    this.cancelBtn = this.dialog.getByRole('button', { name: 'CANCEL' });
+  }
+
+  async fillProgramDetails(data) {
+    await this.programName.fill(data.name);
+    if (data.description) await this.programDescription.fill(data.description);
+    await this.startDate.fill(data.startDate);
+    await this.endDate.fill(data.endDate);
+    await this.activeMarket.click();
+    await this.page.getByRole('option', { name: data.activeMarket }).click();
+    await this.ownerGroup.click();
+    await this.page.getByRole('option', { name: data.ownerGroup }).click();
+  }
+
+  async setRedemptionRules(maxAttempts, per, period) {
+    await this.maxValidAttempts.fill(String(maxAttempts));
+    await this.periodDropdown.click();
+    await this.page.getByRole('option', { name: period }).click();
+  }
+
+  async toggleProfanityCheck(enable) {
+    if (enable) await this.profanityCheckbox.check();
+    else await this.profanityCheckbox.uncheck();
+  }
+
+  async runRiskCheck() {
+    await this.checkRiskBtn.click();
+    await expect(this.riskGauge).toBeVisible();
+  }
+
+  async selectCharacterSet(opts = {}) {
+    if (opts.digits) await this.selectAllDigits.check();
+    if (opts.lower) await this.selectAllLower.check();
+    if (opts.upper) await this.selectAllUpper.check();
+  }
+
+  async save() {
+    await this.saveBtn.click();
+  }
+}
+
+module.exports = { CreateProgramModal };
+
+
+====
+
+
+Programdetailpage · JS
+
+
+
+const { expect } = require('@playwright/test');
+
+class ProgramDetailPage {
+  /** @param {import('@playwright/test').Page} page */
+  constructor(page) {
+    this.page = page;
+    this.releasesTab = page.getByRole('tab', { name: 'Releases' });
+    this.campaignsTab = page.getByRole('tab', { name: 'Campaigns' });
+    this.searchReleaseInput = page.getByPlaceholder('Search Release by Name or Id');
+    this.createNewReleaseBtn = page.getByRole('button', { name: /create new release/i });
+  }
+
+  releaseRow(releaseId) {
+    return this.page.getByRole('row', { name: new RegExp(releaseId) });
+  }
+
+  async expandRelease(releaseId) {
+    const row = this.releaseRow(releaseId);
+    await row.locator('button[aria-expanded]').click(); // chevron/expand toggle
+    await expect(row.locator('button[aria-expanded="true"]')).toBeVisible();
+  }
+
+  async getLotDetails(releaseId) {
+    const panel = this.page.locator(`[data-release-id="${releaseId}"] >> text=Lots`).locator('..');
+    return {
+      name: await panel.locator('text=Name:').innerText(),
+      allotedCodes: await panel.locator('text=Alloted codes:').innerText(),
+    };
+  }
+
+  async getBatchOrgField(releaseId) {
+    const panel = this.page.locator(`[data-release-id="${releaseId}"] >> text=Batches`).locator('..');
+    return panel.locator('text=Org:').innerText();
+  }
+}
+
+module.exports = { ProgramDetailPage };
+
+
+====
+
+Create program.spec · JS
+
+const { test, expect } = require('@playwright/test');
+const { ProgramsPage } = require('../pages/ProgramsPage');
+const { CreateProgramModal } = require('../pages/CreateProgramModal');
+const { ProgramDetailPage } = require('../pages/ProgramDetailPage');
+
+// NOTE: the outermost describe title becomes the "functional area" name
+// in the dashboard report (see scripts/generate-report.js). Group specs
+// by feature (e.g. 'Create Program', 'Risk Calculator', 'Release Accordion')
+// rather than by page, since flows here span multiple pages/modals.
+test.describe('Create Program', () => {
+
+  test('create a new program end-to-end and verify release accordion', async ({ page }) => {
+    const programsPage = new ProgramsPage(page);
+    const modal = new CreateProgramModal(page);
+    const detailPage = new ProgramDetailPage(page);
+
+    const programName = `Automation-${Date.now()}`;
+
+    await test.step('Open Programs page', async () => {
+      await programsPage.goto();
+      await expect(page).toHaveURL(/\/programs$/);
+    });
+
+    await test.step('Open Create New Program modal', async () => {
+      await programsPage.openCreateNewProgram();
+      await expect(modal.dialog).toBeVisible();
+    });
+
+    await test.step('Fill program details', async () => {
+      await modal.fillProgramDetails({
+        name: programName,
+        description: 'Created by Playwright automation',
+        startDate: '2026-09-16T00:00:00',
+        endDate: '2026-10-31T00:00:00',
+        activeMarket: 'US',
+        ownerGroup: 'QA-Team',
+      });
+    });
+
+    await test.step('Set redemption rules and toggles', async () => {
+      await modal.setRedemptionRules(25, 1, 'Days (Rolling)');
+      await modal.toggleProfanityCheck(true);
+    });
+
+    await test.step('Run risk calculator and confirm gauge renders', async () => {
+      await modal.runRiskCheck();
+    });
+
+    await test.step('Select character set (digits + uppercase)', async () => {
+      await modal.selectCharacterSet({ digits: true, upper: true });
+    });
+
+    await test.step('Save program and confirm it appears in the list', async () => {
+      await modal.save();
+      await expect(modal.dialog).toBeHidden();
+      await expect(page.getByRole('cell', { name: programName })).toBeVisible();
+    });
+
+    await test.step('Open new program and expand its first release', async () => {
+      await programsPage.openProgramByName(programName);
+      await expect(page.getByRole('heading', { name: programName })).toBeVisible();
+
+      const releaseId = await detailPage.releaseRow('').locator('td').first().innerText();
+      await detailPage.expandRelease(releaseId);
+
+      const lots = await detailPage.getLotDetails(releaseId);
+      expect(lots.allotedCodes).toContain('Alloted codes:');
+    });
+  });
+
+  test('cancel button discards unsaved program', async ({ page }) => {
+    const programsPage = new ProgramsPage(page);
+    const modal = new CreateProgramModal(page);
+
+    await test.step('Open modal, partially fill, then cancel', async () => {
+      await programsPage.goto();
+      await programsPage.openCreateNewProgram();
+      await modal.programName.fill('Should not be saved');
+      await modal.cancelBtn.click();
+      await expect(modal.dialog).toBeHidden();
+    });
+  });
+
+});
+
+
+===
+
+generatereport.js
+
+#!/usr/bin/env node
+/**
+ * generate-report.js
+ * ---------------------------------------------------------------
+ * Reads Playwright's JSON reporter output (test-results/results.json)
+ * and renders a dashboard-style HTML report:
+ *   - KPI summary (total / passed / failed / skipped / pass rate / duration)
+ *   - Coverage-by-functionality bars (grouped by top-level `test.describe` name)
+ *   - Stability tracker across the last N runs (reads/writes history.json)
+ *   - Detailed, expandable per-test results with steps + error text
+ *
+ * No extra npm packages needed - just Node's built-in fs/path.
+ *
+ * Usage:
+ *   node scripts/generate-report.js
+ *   (run this after `npx playwright test`, since it needs
+ *    test-results/results.json to already exist)
+ *
+ * Requires playwright.config.js to include the json reporter, e.g.:
+ *   reporter: [ ['list'], ['html'], ['json', { outputFile: 'test-results/results.json' }] ]
+ *
+ * Grouping tests into "functional areas":
+ *   The script uses the OUTERMOST test.describe() title as the area name.
+ *   So in your spec files, wrap related tests like:
+ *     test.describe('Risk Calculator', () => { ... });
+ *     test.describe('Release Accordion', () => { ... });
+ *   Tests with no describe wrapper fall under "General".
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const RESULTS_JSON = path.join(process.cwd(), 'test-results', 'results.json');
+const HISTORY_JSON = path.join(process.cwd(), 'test-results', 'history.json');
+const OUTPUT_HTML = path.join(process.cwd(), 'test-results', 'dashboard-report.html');
+const MAX_HISTORY_RUNS = 8;
+
+function loadJson(filePath, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  } catch {
+    return fallback;
+  }
+}
+
+// ---------------------------------------------------------------
+// 1. Walk the Playwright JSON suite tree and flatten into test records
+// ---------------------------------------------------------------
+function flattenTests(rawResults) {
+  const tests = [];
+
+  function walkSuite(suite, areaStack) {
+    // A suite with `specs` is a leaf group (describe block or file root)
+    const nextAreaStack = suite.title ? [...areaStack, suite.title] : areaStack;
+
+    (suite.specs || []).forEach((spec) => {
+      spec.tests.forEach((test) => {
+        const lastResult = test.results[test.results.length - 1] || {};
+        const allResults = test.results || [];
+
+        tests.push({
+          // outermost describe title = functional area; fall back to "General"
+          area: nextAreaStack[0] || 'General',
+          fullTitlePath: [...nextAreaStack, spec.title].join(' > '),
+          title: spec.title,
+          status: lastResult.status || 'skipped', // passed | failed | timedOut | skipped
+          duration: allResults.reduce((sum, r) => sum + (r.duration || 0), 0),
+          steps: flattenSteps(lastResult.steps || []),
+          error: lastResult.error ? lastResult.error.message : null,
+          attachments: (lastResult.attachments || []).map((a) => a.name),
+          retries: allResults.length - 1,
+        });
+      });
+    });
+
+    (suite.suites || []).forEach((child) => walkSuite(child, nextAreaStack));
+  }
+
+  (rawResults.suites || []).forEach((fileSuite) => walkSuite(fileSuite, []));
+  return tests;
+}
+
+// Playwright nests step objects; flatten to a simple list with pass/fail
+function flattenSteps(steps, acc = []) {
+  steps.forEach((step) => {
+    // skip Playwright's internal "expect" / "pw:api" noise, keep test.step() entries
+    if (step.category === 'test.step') {
+      acc.push({
+        title: step.title,
+        duration: step.duration,
+        status: step.error ? 'failed' : 'passed',
+      });
+    }
+    if (step.steps && step.steps.length) flattenSteps(step.steps, acc);
+  });
+  return acc;
+}
+
+// ---------------------------------------------------------------
+// 2. Roll tests up into functional-area pass/fail counts
+// ---------------------------------------------------------------
+function buildAreaSummary(tests) {
+  const areas = {};
+  tests.forEach((t) => {
+    if (!areas[t.area]) areas[t.area] = { passed: 0, failed: 0, total: 0 };
+    areas[t.area].total += 1;
+    if (t.status === 'passed') areas[t.area].passed += 1;
+    else if (t.status !== 'skipped') areas[t.area].failed += 1;
+  });
+  return areas;
+}
+
+// ---------------------------------------------------------------
+// 3. Stability history — append this run, keep last N
+// ---------------------------------------------------------------
+function updateHistory(tests) {
+  const history = loadJson(HISTORY_JSON, []);
+  const runEntry = {
+    timestamp: new Date().toISOString(),
+    results: Object.fromEntries(tests.map((t) => [t.fullTitlePath, t.status])),
+  };
+  history.push(runEntry);
+  const trimmed = history.slice(-MAX_HISTORY_RUNS);
+  fs.writeFileSync(HISTORY_JSON, JSON.stringify(trimmed, null, 2));
+  return trimmed;
+}
+
+function buildStabilityRows(tests, history) {
+  return tests.map((t) => {
+    const dots = history.map((run) => run.results[t.fullTitlePath] || 'skip');
+    const failCount = dots.filter((d) => d === 'failed' || d === 'timedOut').length;
+    let verdict = 'stable';
+    if (failCount === dots.length && dots.length > 1) verdict = 'consistently failing';
+    else if (failCount > 0) verdict = 'flaky';
+    return { title: t.title, dots, verdict };
+  });
+}
+
+// ---------------------------------------------------------------
+// 4. Render HTML
+// ---------------------------------------------------------------
+function esc(str = '') {
+  return String(str).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+function renderAreaBars(areaSummary) {
+  return Object.entries(areaSummary)
+    .map(([name, s]) => {
+      const passPct = s.total ? Math.round((s.passed / s.total) * 100) : 0;
+      const failPct = 100 - passPct;
+      return `
+        <div class="area-row">
+          <div class="top-line"><span class="name">${esc(name)}</span><span class="count">${s.passed}/${s.total}</span></div>
+          <div class="bar-track">
+            <div class="bar-pass" style="width:${passPct}%"></div>
+            <div class="bar-fail" style="width:${failPct}%"></div>
+          </div>
+        </div>`;
+    })
+    .join('\n');
+}
+
+function renderStabilityRows(rows) {
+  const colorFor = { stable: 'var(--green)', flaky: 'var(--amber)', 'consistently failing': 'var(--red)' };
+  return rows
+    .map(
+      (r) => `
+      <div class="history-row">
+        <span class="name">${esc(r.title)}</span>
+        <div class="history-dots">
+          ${r.dots.map((d) => `<i class="${d === 'passed' ? 'p' : d === 'skip' ? 's' : 'f'}"></i>`).join('')}
+        </div>
+        <span class="duration" style="color:${colorFor[r.verdict]}">${r.verdict === 'stable' ? 'stable' : '⚠ ' + r.verdict}</span>
+      </div>`
+    )
+    .join('\n');
+}
+
+function renderTestDetails(tests) {
+  return tests
+    .map((t) => {
+      const badgeClass = t.status === 'passed' ? 'pass' : 'fail';
+      const stepsHtml = t.steps
+        .map(
+          (s) => `
+        <div class="step">
+          <span class="dot ${s.status}"></span>
+          <span class="step-name">${esc(s.title)}</span>
+          <span class="step-time">${(s.duration / 1000).toFixed(1)}s</span>
+        </div>`
+        )
+        .join('\n');
+
+      return `
+      <div class="test ${badgeClass === 'fail' ? 'open' : ''}" onclick="this.classList.toggle('open')">
+        <div class="test-header">
+          <div class="test-title">
+            <span class="chevron">▶</span>
+            <span class="tag">${esc(t.area)}</span>
+            <span class="badge ${badgeClass}">${badgeClass === 'pass' ? 'Passed' : 'Failed'}</span>
+            <span>${esc(t.title)}</span>
+          </div>
+          <span class="duration">${(t.duration / 1000).toFixed(1)}s</span>
+        </div>
+        <div class="steps">
+          ${stepsHtml}
+          ${t.error ? `<div class="error-box">${esc(t.error)}</div>` : ''}
+        </div>
+      </div>`;
+    })
+    .join('\n');
+}
+
+function renderHtml({ kpi, areaSummary, stabilityRows, tests }) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>UI Automation Report</title>
+<style>
+  :root{--bg:#0e1014;--panel:#171a21;--panel2:#1e222b;--border:#2a2f3a;--text:#e6e8ec;--muted:#8b93a3;--green:#2ecc71;--red:#e74c3c;--amber:#f2b134;--accent:#4da3ff;}
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  header{background:linear-gradient(135deg,#161a22,#1c2130);border-bottom:1px solid var(--border);padding:24px 32px;}
+  header h1{margin:0;font-size:20px;}
+  header .meta{color:var(--muted);font-size:13px;margin-top:6px;}
+  main{padding:28px 32px 60px;max-width:1280px;margin:0 auto;}
+  section{margin-bottom:34px;}
+  section > h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 14px;}
+  .kpi-row{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;}
+  .kpi{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;}
+  .kpi .num{font-size:28px;font-weight:800;}
+  .kpi .label{font-size:11.5px;color:var(--muted);text-transform:uppercase;margin-top:6px;}
+  .kpi.pass .num{color:var(--green);} .kpi.fail .num{color:var(--red);} .kpi.skip .num{color:var(--amber);} .kpi.rate .num{color:var(--accent);}
+  .area-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 22px;}
+  .area-row{margin-bottom:14px;}
+  .top-line{display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;}
+  .top-line .name{font-weight:600;} .top-line .count{color:var(--muted);}
+  .bar-track{height:9px;border-radius:5px;background:var(--panel2);overflow:hidden;display:flex;}
+  .bar-pass{background:var(--green);height:100%;} .bar-fail{background:var(--red);height:100%;}
+  .history-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 22px;}
+  .history-row{display:flex;align-items:center;gap:14px;margin-bottom:12px;}
+  .history-row .name{width:300px;font-size:13px;flex-shrink:0;}
+  .history-dots{display:flex;gap:4px;}
+  .history-dots i{width:14px;height:14px;border-radius:3px;display:inline-block;}
+  .history-dots i.p{background:var(--green);} .history-dots i.f{background:var(--red);} .history-dots i.s{background:var(--panel2);border:1px solid var(--border);}
+  .test{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden;}
+  .test-header{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;cursor:pointer;}
+  .test-title{display:flex;align-items:center;gap:10px;font-size:14px;}
+  .tag{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:5px;background:var(--panel2);color:var(--accent);border:1px solid var(--border);}
+  .badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:20px;}
+  .badge.pass{background:rgba(46,204,113,.15);color:var(--green);} .badge.fail{background:rgba(231,76,60,.15);color:var(--red);}
+  .duration{color:var(--muted);font-size:12px;}
+  .steps{border-top:1px solid var(--border);padding:6px 18px 14px;display:none;}
+  .test.open .steps{display:block;} .test.open .chevron{transform:rotate(90deg);}
+  .chevron{transition:transform .15s;color:var(--muted);}
+  .step{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:13px;border-bottom:1px dashed var(--border);}
+  .step:last-child{border-bottom:none;}
+  .step .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;} .dot.pass{background:var(--green);} .dot.failed{background:var(--red);}
+  .step .step-name{flex:1;} .step .step-time{color:var(--muted);font-size:11px;}
+  .error-box{margin-top:8px;background:#2a1518;border:1px solid #5a2a2f;border-radius:8px;padding:12px 14px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#ff9d9d;white-space:pre-wrap;}
+</style>
+</head>
+<body>
+<header>
+  <h1>UI Automation Report</h1>
+  <div class="meta">Generated ${new Date().toLocaleString()}</div>
+</header>
+<main>
+  <section>
+    <div class="kpi-row">
+      <div class="kpi total"><div class="num">${kpi.total}</div><div class="label">Total Tests</div></div>
+      <div class="kpi pass"><div class="num">${kpi.passed}</div><div class="label">Passed</div></div>
+      <div class="kpi fail"><div class="num">${kpi.failed}</div><div class="label">Failed</div></div>
+      <div class="kpi skip"><div class="num">${kpi.skipped}</div><div class="label">Skipped</div></div>
+      <div class="kpi rate"><div class="num">${kpi.passRate}%</div><div class="label">Pass Rate</div></div>
+      <div class="kpi"><div class="num">${kpi.durationSec}s</div><div class="label">Duration</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Coverage by Functionality</h2>
+    <div class="area-card">${renderAreaBars(areaSummary)}</div>
+  </section>
+
+  <section>
+    <h2>Stability — Last ${MAX_HISTORY_RUNS} Runs</h2>
+    <div class="history-card">${renderStabilityRows(stabilityRows)}</div>
+  </section>
+
+  <section>
+    <h2>Detailed Results</h2>
+    ${renderTestDetails(tests)}
+  </section>
+</main>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------
+// main
+// ---------------------------------------------------------------
+function main() {
+  const raw = loadJson(RESULTS_JSON, null);
+  if (!raw) {
+    console.error(`Could not find ${RESULTS_JSON}. Run "npx playwright test" first (with the json reporter enabled).`);
+    process.exit(1);
+  }
+
+  const tests = flattenTests(raw);
+  const areaSummary = buildAreaSummary(tests);
+  const history = updateHistory(tests);
+  const stabilityRows = buildStabilityRows(tests, history);
+
+  const passed = tests.filter((t) => t.status === 'passed').length;
+  const failed = tests.filter((t) => t.status === 'failed' || t.status === 'timedOut').length;
+  const skipped = tests.filter((t) => t.status === 'skipped').length;
+  const total = tests.length;
+  const durationMs = tests.reduce((sum, t) => sum + t.duration, 0);
+
+  const kpi = {
+    total,
+    passed,
+    failed,
+    skipped,
+    passRate: total ? Math.round((passed / total) * 100) : 0,
+    durationSec: (durationMs / 1000).toFixed(1),
+  };
+
+  const html = renderHtml({ kpi, areaSummary, stabilityRows, tests });
+  fs.mkdirSync(path.dirname(OUTPUT_HTML), { recursive: true });
+  fs.writeFileSync(OUTPUT_HTML, html);
+  console.log(`Dashboard report written to ${OUTPUT_HTML}`);
+}
+
+main();
+
+
+====
+
+packageupdate
+{
+  "name": "coke-codes-ui-automation",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "report:dashboard": "node scripts/generate-report.js",
+    "test:all": "npm test; npm run report:dashboard",
+    "codegen": "playwright codegen https://ui-gcp.alpha.codes.coke.com/programs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
+
+===
+
+Create program.spec · JS
+
+
+
+const { test, expect } = require('@playwright/test');
+const { ProgramsPage } = require('../pages/ProgramsPage');
+const { CreateProgramModal } = require('../pages/CreateProgramModal');
+const { ProgramDetailPage } = require('../pages/ProgramDetailPage');
+
+// NOTE: the outermost describe title becomes the "functional area" name
+// in the dashboard report (see scripts/generate-report.js). Group specs
+// by feature (e.g. 'Create Program', 'Risk Calculator', 'Release Accordion')
+// rather than by page, since flows here span multiple pages/modals.
+test.describe('Create Program', () => {
+
+  test('create a new program end-to-end and verify release accordion', async ({ page }) => {
+    const programsPage = new ProgramsPage(page);
+    const modal = new CreateProgramModal(page);
+    const detailPage = new ProgramDetailPage(page);
+
+    const programName = `Automation-${Date.now()}`;
+
+    await test.step('Open Programs page', async () => {
+      await programsPage.goto();
+      await expect(page).toHaveURL(/\/programs$/);
+    });
+
+    await test.step('Open Create New Program modal', async () => {
+      await programsPage.openCreateNewProgram();
+      await expect(modal.dialog).toBeVisible();
+    });
+
+    await test.step('Fill program details', async () => {
+      await modal.fillProgramDetails({
+        name: programName,
+        description: 'Created by Playwright automation',
+        startDate: '2026-09-16T00:00:00',
+        endDate: '2026-10-31T00:00:00',
+        activeMarket: 'US',
+        ownerGroup: 'QA-Team',
+      });
+    });
+
+    await test.step('Set redemption rules and toggles', async () => {
+      await modal.setRedemptionRules(25, 1, 'Days (Rolling)');
+      await modal.toggleProfanityCheck(true);
+    });
+
+    await test.step('Run risk calculator and confirm gauge renders', async () => {
+      await modal.runRiskCheck();
+    });
+
+    await test.step('Select character set (digits + uppercase)', async () => {
+      await modal.selectCharacterSet({ digits: true, upper: true });
+    });
+
+    await test.step('Save program and confirm it appears in the list', async () => {
+      await modal.save();
+      await expect(modal.dialog).toBeHidden();
+      await expect(page.getByRole('cell', { name: programName })).toBeVisible();
+    });
+
+    await test.step('Open new program and expand its first release', async () => {
+      await programsPage.openProgramByName(programName);
+      await expect(page.getByRole('heading', { name: programName })).toBeVisible();
+
+      const releaseId = await detailPage.releaseRow('').locator('td').first().innerText();
+      await detailPage.expandRelease(releaseId);
+
+      const lots = await detailPage.getLotDetails(releaseId);
+      expect(lots.allotedCodes).toContain('Alloted codes:');
+    });
+  });
+
+  test('cancel button discards unsaved program', async ({ page }) => {
+    const programsPage = new ProgramsPage(page);
+    const modal = new CreateProgramModal(page);
+
+    await test.step('Open modal, partially fill, then cancel', async () => {
+      await programsPage.goto();
+      await programsPage.openCreateNewProgram();
+      await modal.programName.fill('Should not be saved');
+      await modal.cancelBtn.click();
+      await expect(modal.dialog).toBeHidden();
+    });
+  });
+
+});
+
+
+====
+
+readme
+
+# Coke Codes UI Automation - Sample (JavaScript)
+
+Same flow as before, plain JS / CommonJS (no build step needed).
+
+## Setup
+```bash
+npm install
+npx playwright install
+```
+
+## Record real selectors first
+```bash
+npm run codegen
+```
+Click through the app once; copy the generated locators into `pages/*.js`, especially
+the spots marked `// adjust` (the "per" input, risk gauge, accordion toggle).
+
+## Run
+```bash
+npm test              # headless run, produces HTML + JSON report
+npm run test:headed   # watch it run in a real browser
+npm run report        # opens the interactive HTML report
+```
+
+## Reports
+- **HTML report** (`playwright-report/index.html`): each `test.step()` (Open modal →
+  Fill details → Risk calc → Save → Expand accordion) shows as its own line with
+  timing, so a non-technical reviewer can see exactly where something failed.
+- **Trace** (`trace: 'on'` in config): full screenshot/DOM/network trace per run,
+  open via the HTML report or `npx playwright show-trace <trace.zip>`.
+- **Custom dashboard report** (`test-results/dashboard-report.html`): generated by
+  `scripts/generate-report.js`, which reads `test-results/results.json` (Playwright's
+  JSON reporter output — already wired up in `playwright.config.js`) and renders:
+  - KPI summary (total / passed / failed / pass rate / duration)
+  - Coverage-by-functionality bars, grouped by each spec file's outermost
+    `test.describe()` title — so group your tests by feature
+    (`'Create Program'`, `'Risk Calculator'`, `'Release Accordion'`, etc.)
+    rather than by page, since most flows here span multiple pages/modals
+  - A stability tracker across the last 8 runs (stored in `test-results/history.json`,
+    which the script maintains automatically) — flags tests as "flaky" or
+    "consistently failing" instead of just pass/fail on the latest run
+  - Expandable per-test detail with steps and error text, same as the built-in report
+
+  Run it right after your tests:
+  ```bash
+  npm test
+  npm run report:dashboard      # writes test-results/dashboard-report.html
+  # or do both in one go:
+  npm run test:all
+  ```
+  No extra npm packages required — it only uses Node's built-in `fs`/`path`.
+  
+
+
