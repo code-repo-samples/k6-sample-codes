@@ -1,3 +1,25 @@
+ETag is a response header (a "validator") that identifies a specific version of a resource — usually a hash or version tag like "33a64df551425fcc55e4d42a148795d9f25f89d". Browsers/CDNs send it back as If-None-Match on the next request so the server can reply 304 Not Modified instead of resending the full body. It's a caching/revalidation mechanism, separate from Cache-Control.
+
+Vary (the column next to it) tells caches which request headers affect the response — e.g. Vary: Accept-Encoding, Origin means "cache separately per encoding/origin." From the real headers you shared earlier, your site does send Vary on every response but genuinely has no ETag header at all. So Vary% = 100% is correct; ETag% = 100% would be wrong.
+
+Walking through the actual detection code, it only counts a hit when the header is genuinely there:
+
+js
+const etagValue = getHeaderCI(headers, cfg.etagHeader);   // cfg.etagHeader = 'ETag'
+if (etagValue !== undefined && String(etagValue).length > 0) {
+    etagPresentCount.add(1, { page: id });
+}
+
+getHeaderCI does a case-insensitive scan of res.headers for a key matching "etag" — if it's genuinely absent, this returns undefined and the counter never increments. There's no logic path here that would flip that to "present" on its own. So if you're seeing 100% with a real absence confirmed via curl/devtools, it's almost certainly one of these:
+
+You're testing a different target than you inspected. If CONFIG.urls still points at http://localhost:8000/page1 etc. (the defaults), many local static servers (Node's http-server, Express's express.static, nginx) auto-generate an ETag on every response — genuinely 100% for that server, even though the real production page you checked with curl has none.
+CDN-conditional ETag. Some CDNs (Akamai, Fastly, GCLB in some configs) only attach an ETag for certain negotiated responses (e.g. specific Accept-Encoding/compression paths, or only on cache MISS from origin) — so a plain curl without matching headers can see a different response path than k6's actual request.
+Stale report. You're looking at an HTML/JSON from a previous run (against a different config or before a header changed), not a fresh run against the current target.
+
+Fastest way to confirm which one it is — add a one-off debug line (first iteration only, so it doesn't turn into per-request logging) right after const res = http.request(...) in runTest():
+
+==
+
 #!/usr/bin/env node
 /**
  * =============================================================================
