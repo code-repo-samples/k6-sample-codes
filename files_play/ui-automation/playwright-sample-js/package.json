@@ -1,0 +1,19 @@
+{
+  "name": "coke-codes-ui-automation",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "playwright test",
+    "test:journey": "playwright test tests/e2e-program-journey.spec.js",
+    "test:negative": "playwright test tests/negative-cases.spec.js",
+    "test:other": "playwright test tests/other-pages.spec.js",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report",
+    "report:dashboard": "node scripts/generate-report.js",
+    "test:all": "npm test; npm run report:dashboard",
+    "codegen": "playwright codegen https://ui-gcp.alpha.codes.coke.com/programs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "dotenv": "^16.4.5"
+  }
+}

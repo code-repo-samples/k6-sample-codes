@@ -1,0 +1,40 @@
+{
+  "program": {
+    "namePrefix": "AutoProgram",
+    "description": "Created by Playwright automation",
+    "startDate": "2026-09-16T00:00:00",
+    "endDate": "2026-10-31T00:00:00",
+    "activeMarket": "United States",
+    "ownerGroup": "QA-Team",
+    "maxValidAttempts": 25,
+    "redemptionPer": 1,
+    "redemptionPeriod": "Days (Rolling)",
+    "characterSet": { "digits": true, "lower": false, "upper": true }
+  },
+  "release": {
+    "namePrefix": "Release",
+    "startDay": "01",
+    "endDay": "29"
+  },
+  "lot": {
+    "namePrefix": "Lot"
+  },
+  "batch": {
+    "codesPerFile": 1000,
+    "organizationId": "ORG-0001",
+    "promotionName": "Promotion01"
+  },
+  "promotion": {
+    "namePrefix": "Promotion",
+    "startDay": "01",
+    "endDay": "28"
+  },
+  "campaign": {
+    "namePrefix": "Campaign"
+  },
+  "gpgUpload": {
+    "filePath": "test-data/fixtures/sample-public-key.asc",
+    "fromDate": "2026-01-01",
+    "toDate": "2026-12-31"
+  }
+}
